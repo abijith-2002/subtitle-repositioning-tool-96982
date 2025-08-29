@@ -19,13 +19,21 @@ python-multipart>=0.0.6,<0.0.99
 # Core processing libs
 numpy==1.26.4
 opencv-python-headless==4.8.0.76
-pysrt==1.1.2
-rapidocr-onnxruntime==1.3.26
+# Use pure-Python SRT parser compatible with Python 3.12
+srt>=3.5,<4
+
+# OCR engine (optional, graceful fallback if not available)
+# Relax pin to allow Python 3.12 compatible wheels; manylinux availability varies.
+rapidocr-onnxruntime>=1.3.0,<2.0.0
 
 # Optional (benign, used for envs if needed)
 python-dotenv>=1.0,<2
 
+# Linting (needed by CI linter script)
+flake8>=6,<8
+
 # Notes:
-# - Removed dev/test tools (pytest, flake8, rich, fastapi-cli) to reduce install surface.
+# - Removed dev/test tools (pytest, fastapi-cli) to reduce install surface.
 # - Avoid pinning low-level libs (certifi, idna, httpx) unless used directly.
 # - If you need GPU/OpenCV features, adjust opencv-python-headless version accordingly.
+# - pysrt removed (incompatible with Python 3.12). Using 'srt' package instead.

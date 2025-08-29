@@ -7,10 +7,11 @@ import os
 import re
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 
 import cv2
 import numpy as np
-import pysrt
+import srt  # Python 3.12 compatible SRT parser
 
 try:
     # RapidOCR ONNXRuntime engine for detection
@@ -50,14 +51,9 @@ def detect_using_rapidocr(img):
     return detections
 
 
-def to_ass_timestamp(srt_time):
-    """Convert pysrt.SubRipTime to ASS H:MM:SS.CC format."""
-    total_ms = (
-        srt_time.hours * 3600 * 1000
-        + srt_time.minutes * 60 * 1000
-        + srt_time.seconds * 1000
-        + srt_time.milliseconds
-    )
+def to_ass_timestamp_from_timedelta(td: timedelta) -> str:
+    """Convert a timedelta to ASS H:MM:SS.CC format."""
+    total_ms = int(td.total_seconds() * 1000)
     hours = total_ms // 3600000
     minutes = (total_ms % 3600000) // 60000
     seconds = (total_ms % 60000) // 1000
@@ -127,28 +123,26 @@ def get_position_for_segment(video_path, start_sec, end_sec, min_frames=3):
     return decide_subtitle_position(filtered_detections_per_frame, frame_height)
 
 
-def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_workers=5):
-    """Read SRT, run OCR in parallel, output ASS with repositioned alignment tags."""
-    subs = pysrt.open(srt_path)
+def _parse_srt_file(path: str):
+    """Parse SRT file contents into a list of srt.Subtitle entries."""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        contents = f.read()
+    return list(srt.parse(contents))
 
-    def process_sub(sub):
-        start_sec = (
-            sub.start.hours * 3600
-            + sub.start.minutes * 60
-            + sub.start.seconds
-            + sub.start.milliseconds / 1000
-        )
-        end_sec = (
-            sub.end.hours * 3600
-            + sub.end.minutes * 60
-            + sub.end.seconds
-            + sub.end.milliseconds / 1000
-        )
+
+def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_workers=5):
+    """Read SRT via srt module, run OCR in parallel, output ASS with repositioned alignment tags."""
+    subs = _parse_srt_file(srt_path)
+
+    def process_sub(sub: srt.Subtitle):
+        start_sec = sub.start.total_seconds()
+        end_sec = sub.end.total_seconds()
         position = get_position_for_segment(video_path, start_sec, end_sec, min_frames)
         alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
-        formatted_text = sub.text.replace("\n", r"\N")
+        # sub.content has \n newlines
+        formatted_text = sub.content.replace("\n", r"\N")
         line = (
-            f"Dialogue: 0,{to_ass_timestamp(sub.start)},{to_ass_timestamp(sub.end)},"
+            f"Dialogue: 0,{to_ass_timestamp_from_timedelta(sub.start)},{to_ass_timestamp_from_timedelta(sub.end)},"
             f"Default,,0,0,0,,{alignment_tag}{formatted_text}\n"
         )
         return line
