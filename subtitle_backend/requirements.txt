@@ -8,9 +8,8 @@ starlette~=0.37.2
 # ASGI server (standard pulls uvloop, httptools, websockets optionally where supported)
 uvicorn[standard]~=0.27.1
 
-# Data validation
+# Data validation (let pydantic resolve pydantic-core itself)
 pydantic~=2.6.0
-pydantic-core~=2.18.0
 typing_extensions>=4.8,<5
 
 # File upload parsing
@@ -24,7 +23,7 @@ srt>=3.5,<4
 
 # OCR engine (optional, graceful fallback if not available)
 # Relax pin to allow Python 3.12 compatible wheels; manylinux availability varies.
-rapidocr-onnxruntime>=1.3.0,<2.0.0
+rapidocr-onnxruntime>=1.3.0,<3.0.0
 
 # Optional (benign, used for envs if needed)
 python-dotenv>=1.0,<2
@@ -37,3 +36,4 @@ flake8>=6,<8
 # - Avoid pinning low-level libs (certifi, idna, httpx) unless used directly.
 # - If you need GPU/OpenCV features, adjust opencv-python-headless version accordingly.
 # - pysrt removed (incompatible with Python 3.12). Using 'srt' package instead.
+# - Do not pin pydantic-core directly; pydantic will choose a compatible build for Python 3.12.
