@@ -8,9 +8,28 @@ import shutil
 import uuid
 import traceback
 
-# Import processing functions from our internal module
-# We keep implementation colocated for this task; in a larger project consider splitting into services/
-from .processing import process_subtitle  # noqa
+"""
+FastAPI application entrypoint.
+
+Supports two startup modes:
+1) Package mode (recommended): uvicorn src.api.main:app --app-dir subtitle_backend/src --reload
+2) Script mode: python subtitle_backend/src/api/main.py
+   In script mode we adjust sys.path and fall back to absolute imports to avoid relative import issues.
+"""
+
+# Import processing with dual strategy: relative (package) and absolute (script)
+try:
+    # Package context: "src.api" is a package and relative import is valid
+    from .processing import process_subtitle  # type: ignore
+except Exception:
+    # Script context: adjust sys.path then use absolute import
+    import sys
+
+    current_dir = os.path.dirname(__file__)
+    src_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from src.api.processing import process_subtitle  # type: ignore
 
 # FastAPI metadata and tags for OpenAPI
 app = FastAPI(
@@ -179,7 +198,12 @@ def get_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="job_id not found")
     job = JOBS[job_id]
-    return JobStatusResponse(job_id=job_id, status=job["status"], message=job.get("message"), result_file=os.path.basename(job["result_file"]) if job.get("result_file") else None)
+    return JobStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        message=job.get("message"),
+        result_file=os.path.basename(job["result_file"]) if job.get("result_file") else None,
+    )
 
 
 # PUBLIC_INTERFACE
@@ -218,3 +242,14 @@ def download_result(job_id: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Result file missing")
     return FileResponse(path=file_path, filename=os.path.basename(file_path), media_type="application/octet-stream")
+
+
+if __name__ == "__main__":
+    # Allow running directly: python subtitle_backend/src/api/main.py
+    # Determine project root to run uvicorn with the correct app dir
+    import uvicorn
+
+    current_dir = os.path.dirname(__file__)
+    src_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
+    # Run uvicorn programmatically; host/port can be customized via env if needed
+    uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=False, app_dir=src_dir)  # type: ignore
