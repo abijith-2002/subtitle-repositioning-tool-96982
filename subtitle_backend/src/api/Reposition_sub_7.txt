@@ -1,0 +1,12 @@
+2025-09-01 05:49:42,898 - INFO - get_position_for_segment: 0.0 -> 1.86
+2025-09-01 05:49:42,898 - INFO - get_position_for_segment: 2.12 -> 3.6
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 5.54 -> 7.34
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 7.88 -> 10.24
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 10.24 -> 12.4
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 13.88 -> 15.9
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 17.84 -> 18.88
+2025-09-01 05:49:42,899 - INFO - get_position_for_segment: 19.04 -> 20.84
+2025-09-01 05:49:42,900 - INFO - get_position_for_segment: 20.84 -> 22.96
+2025-09-01 05:49:42,900 - INFO - get_position_for_segment: 22.26 -> 24.26
+2025-09-01 05:49:42,900 - INFO - get_position_for_segment: 25.26 -> 26.3
+2025-09-01 05:50:00,707 - INFO - Repositioned subtitle saved: /home/kavia/workspace/code-generation/attachments/Key_and_Peele_sample1_repositioned.ass
