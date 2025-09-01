@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 import os
@@ -52,6 +52,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class _BodySizeLimitMiddleware:
+    """
+    Middleware to enforce a maximum request body size.
+
+    This helps avoid 413 errors by making the limit explicit and configurable via environment variables.
+
+    Env:
+      - UPLOAD_MAX_SIZE_MB: integer megabytes allowed for request body size; default 2048 (2 GB)
+    """
+    def __init__(self, app: FastAPI, max_body_bytes: int):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        if scope["type"] == "http":
+            # Inspect content-length if provided to avoid reading the whole body
+            headers = dict((k.decode("latin1"), v.decode("latin1")) for k, v in scope.get("headers", []))
+            content_length = headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > self.max_body_bytes:
+                        response = PlainTextResponse(
+                            "Request entity too large",
+                            status_code=413,
+                            headers={"Connection": "close"},
+                        )
+                        return await response(scope, receive, send)
+                except Exception:
+                    # Ignore malformed content-length and fall back to streaming checks
+                    pass
+
+        # Fallback: pass-through to app; python-multipart streams to disk for file uploads.
+        return await self.app(scope, receive, send)
+
+# Configure maximum upload size from environment (in MB), default to 2048 MB
+def _get_max_upload_bytes() -> int:
+    try:
+        mb = int(os.getenv("UPLOAD_MAX_SIZE_MB", "2048"))
+        return max(1, mb) * 1024 * 1024
+    except Exception:
+        return 2048 * 1024 * 1024
+
+# Install middleware
+app.add_middleware(_BodySizeLimitMiddleware, max_body_bytes=_get_max_upload_bytes())
+
 # Storage directories
 BASE_DIR = os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -101,10 +149,11 @@ def health_check():
     "/upload",
     tags=["upload"],
     summary="Upload video and subtitle",
-    description="Upload a video file and a subtitle file to start a processing session. Returns an upload_id that can be used to start processing.",
+    description="Upload a video file and a subtitle file to start a processing session. Returns an upload_id that can be used to start processing. Maximum request size is configurable via the UPLOAD_MAX_SIZE_MB environment variable (default 2048 MB).",
     responses={
         200: {"description": "Upload successful"},
         400: {"description": "Invalid input"},
+        413: {"description": "Uploaded files exceed configured size limit"},
     },
 )
 async def upload_files(video: UploadFile = File(...), subtitle: UploadFile = File(...)):
@@ -247,6 +296,7 @@ def download_result(job_id: str):
 if __name__ == "__main__":
     # Allow running directly: python subtitle_backend/src/api/main.py
     # Determine project root to run uvicorn with the correct app dir
+    # You can control maximum upload size using env var UPLOAD_MAX_SIZE_MB (default: 2048).
     import uvicorn
 
     current_dir = os.path.dirname(__file__)
