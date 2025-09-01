@@ -456,11 +456,12 @@ def process_subtitle(video_path, subtitle_path, max_workers=12):
         reposition_vtt(video_path, subtitle_path, output_file, max_workers=max_workers)
     else:
         raise ValueError(f"Unsupported subtitle format: {ext}")
+    print("output saved at : ", output_file)
 
     return output_file
 
 if __name__ == "__main__":
-    video_path = r"/home/kavia/workspace/code-generation/attachments/output.mp4"
+    video_path = r"/home/kavia/workspace/code-generation/attachments/Key_and_Peele_sample1.mp4"
     subtitle_path = r"/home/kavia/workspace/code-generation/attachments/Key_and_Peele_sample1.srt"
     try:
         resp = process_subtitle(video_path , subtitle_path )
