@@ -458,3 +458,12 @@ def process_subtitle(video_path, subtitle_path, max_workers=12):
         raise ValueError(f"Unsupported subtitle format: {ext}")
 
     return output_file
+
+if __name__ == "__main__":
+    video_path = r"/home/kavia/workspace/code-generation/attachments/output.mp4"
+    subtitle_path = r"/home/kavia/workspace/code-generation/attachments/Key_and_Peele_sample1.srt"
+    try:
+        resp = process_subtitle(video_path , subtitle_path )
+        print("Completed processing")
+    except Exception as e : 
+        print("An exception occured:",e)
