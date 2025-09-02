@@ -1,0 +1,15 @@
+How are you?
+Are you okay?
+what is your end goal?
+What is rust?
+How does the backend decide when to move subtitles to the top versus keeping them at the bottom?
+What subtitle formats are supported for upload and for output after repositioning (SRT, ASS/SSA, VTT)?
+How does the OCR pipeline handle low-contrast or stylized burnt-in text in the video?
+What is the maximum upload size and how can we configure it to avoid HTTP 413 errors?
+Can we preview the repositioned subtitle alignment before downloading the final file?
+How does the job status endpoint indicate queued, running, completed, or error states?
+What are best practices for handling overlapping cues in ASS/SSA where multiple tags already exist?
+How does the API scale with large videos—can we control worker threads or sampling density?
+What error messages are returned if the uploaded file types are not supported?
+Is there a way to customize the alignment thresholds (e.g., bottom threshold ratio) for different video aspect ratios?
+How are temporary upload files stored and cleaned up, and where are processed results saved?
