@@ -556,8 +556,8 @@ def detect_text_vtt(video_path, vtt_path, max_workers = 5):
 def display_results(results):
     results = dict(sorted(results.items()))
     for index , result in results.items():
-        log.info(f"index:{index}")
-        log.info(f"result:{result}")
+        print(f"index:{index}")
+        print(f"result:{result}")
 
 import time
 def process_subtitle(video_path, subtitle_path, max_workers = 12):
@@ -608,7 +608,8 @@ def process_subtitle(video_path, subtitle_path, max_workers = 12):
 
 if __name__ == "__main__":
     # Sample CLI usage (adjust paths)
-    video_path = r"uploads\output.mp4"
-    sub_path = r"outputs\Key_and_Peele_sample1.vtt"  # Try .srt/.ass/.ssa too
+    video_path = r"/home/kavia/workspace/code-generation/uploads/output.mp4"
+    sub_path = r"/home/kavia/workspace/code-generation/uploads/Key_and_Peele_sample1.ass"  # Try .srt/.ass/.ssa too
     max_workers = 10
     process_subtitle(video_path, sub_path , max_workers)
+# /home/kavia/workspace/code-generation/uploads

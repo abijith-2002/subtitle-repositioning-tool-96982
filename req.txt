@@ -1,0 +1,6 @@
+opencv-python
+numpy
+pysrt
+
+typing
+rapidocr_onnxruntime
