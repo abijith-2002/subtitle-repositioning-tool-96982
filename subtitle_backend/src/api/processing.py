@@ -232,18 +232,26 @@ def _parse_srt_file(path: str):
     return list(srt.parse(contents))
 
 
-def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_workers=5):
-    """Read SRT via srt module, run OCR in parallel, output ASS with repositioned alignment tags."""
+def reposition_srt(video_path, srt_path, output_ass_path, detection_results=None, min_frames=3, max_workers=5):
+    """Read SRT via srt module, use provided detection results to position, output ASS with alignment tags."""
     subs = _parse_srt_file(srt_path)
 
-    # Pre-compute segments to deduplicate with caching and reduce thread contention
+    # Pre-compute segments to map indices for lookup
     segments = [(float(sub.start.total_seconds()), float(sub.end.total_seconds())) for sub in subs]
 
     def process_sub(i_sub: int):
         sub = subs[i_sub]
         start_sec, end_sec = segments[i_sub]
-        # When many segments, usage of cache avoids repeated work; also allow a shared context for bursts
-        position = get_position_for_segment(video_path, start_sec, end_sec, min_frames)
+        # Prefer provided detection results
+        position = None
+        if isinstance(detection_results, dict):
+            position = detection_results.get((start_sec, end_sec))
+            if position is None:
+                # try with rounded seconds to mitigate float precision
+                position = detection_results.get((round(start_sec, 3), round(end_sec, 3)))
+        if position is None:
+            # Fallback to on-the-fly decision if not provided
+            position = get_position_for_segment(video_path, start_sec, end_sec, min_frames)
         alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
         formatted_text = sub.content.replace("\n", r"\N")
         line = (
@@ -252,15 +260,14 @@ def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_work
         )
         return i_sub, line
 
-    # Cap workers to a reasonable number to avoid oversubscription with OpenCV/onnxruntime
     workers = max(1, min(int(max_workers), 12))
-    results = {}
+    lines_out = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(process_sub, i) for i in range(len(subs))]
         for fut in as_completed(futures):
             try:
                 i_sub, line = fut.result()
-                results[i_sub] = line
+                lines_out[i_sub] = line
             except Exception as e:
                 log.error("Error processing subtitle: %s", e)
 
@@ -282,15 +289,15 @@ def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_work
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
         for i in range(len(subs)):
-            if i in results:
-                f.write(results[i])
+            if i in lines_out:
+                f.write(lines_out[i])
 
     log.info("Repositioned subtitle saved: %s", output_ass_path)
     return output_ass_path
 
 
-def reposition_ass(video_path, ass_path, output_ass_path, max_workers=5):
-    """Modify alignment tags in ASS dialogue lines."""
+def reposition_ass(video_path, ass_path, output_ass_path, detection_results=None, max_workers=5):
+    """Modify alignment tags in ASS dialogue lines using provided detection results when available."""
     # Prepare a context to avoid repeated video opens across many lines
     ctx = VideoContext(video_path)
 
@@ -306,8 +313,13 @@ def reposition_ass(video_path, ass_path, output_ass_path, max_workers=5):
                 start_str, end_str = m.groups()
                 start_sec = ass_time_to_sec(start_str)
                 end_sec = ass_time_to_sec(end_str)
-                # Use context-aware decision (faster than cached facade for mass calls)
-                position = _decide_position_with_context(ctx, start_sec, end_sec)
+                position = None
+                if isinstance(detection_results, dict):
+                    position = detection_results.get((start_sec, end_sec))
+                    if position is None:
+                        position = detection_results.get((round(start_sec, 3), round(end_sec, 3)))
+                if position is None:
+                    position = _decide_position_with_context(ctx, start_sec, end_sec)
                 if re.search(r"\{\\an\d\}", line):
                     line = re.sub(r"\{\\an\d\}", r"{\an8}" if position == "top" else r"{\an2}", line)
                 else:
@@ -337,8 +349,8 @@ def reposition_ass(video_path, ass_path, output_ass_path, max_workers=5):
     return output_ass_path
 
 
-def reposition_ssa(video_path, ssa_path, output_ssa_path, max_workers=5):
-    """Modify alignment tags in SSA dialogue lines."""
+def reposition_ssa(video_path, ssa_path, output_ssa_path, detection_results=None, max_workers=5):
+    """Modify alignment tags in SSA dialogue lines using provided detection results when available."""
     ctx = VideoContext(video_path)
 
     def ssa_time_to_sec(ts: str) -> float:
@@ -353,7 +365,13 @@ def reposition_ssa(video_path, ssa_path, output_ssa_path, max_workers=5):
                 start_str, end_str = m.groups()
                 start_sec = ssa_time_to_sec(start_str)
                 end_sec = ssa_time_to_sec(end_str)
-                position = _decide_position_with_context(ctx, start_sec, end_sec)
+                position = None
+                if isinstance(detection_results, dict):
+                    position = detection_results.get((start_sec, end_sec))
+                    if position is None:
+                        position = detection_results.get((round(start_sec, 3), round(end_sec, 3)))
+                if position is None:
+                    position = _decide_position_with_context(ctx, start_sec, end_sec)
                 if re.search(r"\{\\an\d\}", line):
                     line = re.sub(r"\{\\an\d\}", r"{\an8}" if position == "top" else r"{\an2}", line)
                 else:
@@ -383,8 +401,8 @@ def reposition_ssa(video_path, ssa_path, output_ssa_path, max_workers=5):
     return output_ssa_path
 
 
-def reposition_vtt(video_path, vtt_path, output_vtt_path, max_workers=5):
-    """Modify 'line:' cue position in VTT based on OCR-detected overlap."""
+def reposition_vtt(video_path, vtt_path, output_vtt_path, detection_results=None, max_workers=5):
+    """Modify 'line:' cue position in VTT using provided detection results when available."""
     ctx = VideoContext(video_path)
 
     def vtt_time_to_sec(ts: str) -> float:
@@ -407,7 +425,13 @@ def reposition_vtt(video_path, vtt_path, output_vtt_path, max_workers=5):
             start_str, end_str = extract_timestamps_string(line)
             start_sec = vtt_time_to_sec(start_str)
             end_sec = vtt_time_to_sec(end_str)
-            position = _decide_position_with_context(ctx, start_sec, end_sec)
+            position = None
+            if isinstance(detection_results, dict):
+                position = detection_results.get((start_sec, end_sec))
+                if position is None:
+                    position = detection_results.get((round(start_sec, 3), round(end_sec, 3)))
+            if position is None:
+                position = _decide_position_with_context(ctx, start_sec, end_sec)
             if "line:" in line:
                 line = re.sub(r"line:\d+%?", "line:0%" if position == "top" else "line:80%", line)
             else:
@@ -439,21 +463,104 @@ def reposition_vtt(video_path, vtt_path, output_vtt_path, max_workers=5):
 
 # PUBLIC_INTERFACE
 def process_subtitle(video_path, subtitle_path, max_workers=12):
-    """Process a subtitle file (srt/ass/ssa/vtt) against a video and write a repositioned output, returning the path."""
+    """Process a subtitle file (srt/ass/ssa/vtt) against a video and write a repositioned output, returning the path.
+
+    This refactored version computes detection results once and passes them to the reposition functions.
+    """
     ext = os.path.splitext(subtitle_path)[1].lower()
 
+    # Helper to compute detection results for a list of (start,end) segments
+    def _compute_positions_for_segments(segments):
+        # Use a single reusable VideoContext to avoid repeated opens
+        ctx = VideoContext(video_path)
+        try:
+            positions = {}
+            # Use a reasonable pool; but keep sequential if very small
+            workers = max(1, min(int(max_workers), 12))
+            def _decide(seg):
+                s, e = seg
+                pos = _decide_position_with_context(ctx, s, e)
+                return (s, e, pos)
+
+            if len(segments) <= 2 or workers == 1:
+                for seg in segments:
+                    s, e, pos = _decide(seg)
+                    positions[(s, e)] = pos
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = [ex.submit(_decide, seg) for seg in segments]
+                    for fut in as_completed(futs):
+                        s, e, pos = fut.result()
+                        positions[(s, e)] = pos
+            return positions
+        finally:
+            ctx.release()
+
     if ext == ".srt":
+        # Parse SRT to build segments
+        subs = _parse_srt_file(subtitle_path)
+        segments = [(float(sub.start.total_seconds()), float(sub.end.total_seconds())) for sub in subs]
+        detection_results = _compute_positions_for_segments(segments)
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
-        reposition_srt(video_path, subtitle_path, output_file, max_workers=max_workers)
+        reposition_srt(video_path, subtitle_path, output_file, detection_results=detection_results, max_workers=max_workers)
     elif ext == ".ass":
+        # Extract segments from ASS file quickly by parsing Dialogue lines
+        def ass_time_to_sec(ts: str) -> float:
+            h, m_, s_cs = ts.split(":")
+            s, cs = s_cs.split(".")
+            return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
+
+        segments = []
+        with open(subtitle_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Dialogue:"):
+                    m = re.match(r"Dialogue: \d+,(.*?),(.*?),", line)
+                    if m:
+                        start_str, end_str = m.groups()
+                        segments.append((ass_time_to_sec(start_str), ass_time_to_sec(end_str)))
+        detection_results = _compute_positions_for_segments(segments)
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
-        reposition_ass(video_path, subtitle_path, output_file, max_workers=max_workers)
+        reposition_ass(video_path, subtitle_path, output_file, detection_results=detection_results, max_workers=max_workers)
     elif ext == ".ssa":
+        # Extract segments from SSA file
+        def ssa_time_to_sec(ts: str) -> float:
+            h, m_, s_cs = ts.split(":")
+            s, cs = s_cs.split(".")
+            return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
+
+        segments = []
+        with open(subtitle_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Dialogue:"):
+                    m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
+                    if m:
+                        start_str, end_str = m.groups()
+                        segments.append((ssa_time_to_sec(start_str), ssa_time_to_sec(end_str)))
+        detection_results = _compute_positions_for_segments(segments)
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ssa"
-        reposition_ssa(video_path, subtitle_path, output_file, max_workers=max_workers)
+        reposition_ssa(video_path, subtitle_path, output_file, detection_results=detection_results, max_workers=max_workers)
     elif ext == ".vtt":
+        # Extract segments from VTT by parsing cue lines
+        def vtt_time_to_sec(ts: str) -> float:
+            hms = ts.strip().split(":")
+            if len(hms) == 3:
+                h, m, s_ms = hms
+            else:
+                h, m, s_ms = 0, *hms
+            s, ms = s_ms.split(".")
+            return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+        segments = []
+        with open(subtitle_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "-->" in line:
+                    m = re.search(r"(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{1,3})", line)
+                    if m:
+                        start_str, end_str = m.groups()
+                        segments.append((vtt_time_to_sec(start_str), vtt_time_to_sec(end_str)))
+        detection_results = _compute_positions_for_segments(segments)
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.vtt"
-        reposition_vtt(video_path, subtitle_path, output_file, max_workers=max_workers)
+        reposition_vtt(video_path, subtitle_path, output_file, detection_results=detection_results, max_workers=max_workers)
     else:
         raise ValueError(f"Unsupported subtitle format: {ext}")
     print("output saved at : ", output_file)
