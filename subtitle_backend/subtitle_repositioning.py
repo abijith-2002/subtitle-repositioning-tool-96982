@@ -1,230 +1,292 @@
 import os
+import cv2
+import numpy as np
+import pysrt
 import re
-import time
+# from rapidocr_test import detect_using_rapidocr
+from rapidocr_onnxruntime import RapidOCR # for detection using rapidocr_onnxruntime
+# from rapidocr import RapidOCR # for detection using rapidocr
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from typing import Dict, List, Tuple, Optional
+logging.basicConfig(
+    filename="Reposition_sub_7.txt",
+    filemode='w',
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    encoding='utf-8'
+)
+log = logging.getLogger()
+engine = RapidOCR()
+a=0
+# def detect_using_rapidocr(img):
+#     global a
+#     print(f"a:{a}")
+#     log.info(f"a:{a}")
+#     result = engine(img)
+#     # log.info(f"result:{result}")
+#     results = result.to_json()
+#     if results:
+#         log.info("detections found for frame")
+#         for i,temp_result in enumerate(results):
+#             print("=====================================")
+#             print(i,'\n',temp_result)
+#             print("======================================")
+#         result.vis(rf"rapid_ocr_frames\result_{a}.jpg")
+#     else:
+#         log.info("no detections found for frame")
+#         cv2.imwrite(rf"rapid_ocr_frames\result_{a}.jpg",img)
+    
+#     a+=1
+#     return results
+def detect_using_rapidocr(img):
+    global a
+    print(f"a:{a}")
+    log.info(f"a:{a}")
 
+    # Run OCR with ONNXRuntime
+    results, _ = engine(img)  # results = [(box, text, score), ...]
+
+    detections = []
+    if results:
+        log.info("detections found for frame")
+        for i, (box, text, score) in enumerate(results):
+            temp_result = {
+                "box": box,
+                "text": text,
+                "score": float(score)
+            }
+            detections.append(temp_result)
+
+    #         print("=====================================")
+    #         print(i, '\n', temp_result)
+    #         print("======================================")
+
+    #     # Visualization
+    #     vis_img = img.copy()
+    #     for box, text, score in results:
+    #         pts = np.array(box, dtype=np.int32)
+    #         cv2.polylines(vis_img, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+    #         x, y = pts[0]
+    #         cv2.putText(vis_img, f"{text} ({score:.2f})", (x, y - 5),
+    #                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    #     cv2.imwrite(rf"rapid_ocr_frames\result_{a}.jpg", vis_img)
+
+    # else:
+    #     log.info("no detections found for frame")
+    #     cv2.imwrite(rf"rapid_ocr_frames\result_{a}.jpg", img)
+
+    a += 1
+    return detections
+def to_ass_timestamp(srt_time):
+    """Convert pysrt.SubRipTime to ASS H:MM:SS.CC format."""
+    total_ms = (
+        srt_time.hours * 3600 * 1000 +
+        srt_time.minutes * 60 * 1000 +
+        srt_time.seconds * 1000 +
+        srt_time.milliseconds
+    )
+    hours = total_ms // 3600000
+    minutes = (total_ms % 3600000) // 60000
+    seconds = (total_ms % 60000) // 1000
+    centiseconds = (total_ms % 1000) // 10
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+def preprocess_threshold(image):
+    """Prepare image for OCR."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+    return thresh
 import cv2
 import numpy as np
 
-# Use pure-Python SRT parser (compatible with Python 3.12) instead of pysrt
-import srt
+def preprocess_using_blackout(image, block_size=50, contrast_thresh=0.3, blur_thresh=100.0):
+    """
+    Preprocess image by blacking out low-contrast or blurry regions.
 
-try:
-    from rapidocr_onnxruntime import RapidOCR  # type: ignore
-except Exception:
-    RapidOCR = None  # type: ignore
+    Args:
+        image (numpy.ndarray): OpenCV-loaded image.
+        block_size (int): Size of the region to check (pixels).
+        contrast_thresh (float): Contrast threshold (lower = blacked out).
+        blur_thresh (float): Laplacian variance threshold for blur.
 
-# Configure logging with moderate verbosity
-logging.basicConfig(
-    filename="Reposition_sub_7.txt",
-    filemode="w",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    encoding="utf-8",
-)
-log = logging.getLogger(__name__)
+    Returns:
+        numpy.ndarray: Processed image with blacked-out regions.
+    """
+    output = image.copy()
+    h, w = image.shape[:2]
 
-# Initialize OCR engine once (if available)
-_engine = RapidOCR() if RapidOCR else None
-_frame_counter = 0
+    for y in range(0, h, block_size):
+        for x in range(0, w, block_size):
+            roi = image[y:y+block_size, x:x+block_size]
 
+            if roi.size == 0:
+                continue
 
-def _safe_video_capture(path: str) -> cv2.VideoCapture:
-    """Open video with OpenCV and verify it opened successfully."""
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {path}")
-    return cap
+            # Contrast check
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            I_max, I_min = np.max(gray), np.min(gray)
+            contrast = (I_max - I_min) / (I_max + I_min + 1e-5)
 
+            # Blur check
+            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-class _VideoContext:
-    """Reusable video context to avoid reopening for each segment."""
+            # Blackout if low quality
+            if contrast < contrast_thresh or variance < blur_thresh:
+                output[y:y+block_size, x:x+block_size] = (0, 0, 0)
 
-    def __init__(self, video_path: str):
-        self.path = video_path
-        self.cap = _safe_video_capture(video_path)
-        self.fps: float = self.cap.get(cv2.CAP_PROP_FPS) or 24.0
-        self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.frame_count: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    return output
+def preprocess(image, block_size=50, contrast_thresh=0.3, blur_thresh=100.0,
+               adaptive_block=15, adaptive_C=5):
+    """
+    Preprocess image by:
+    1. Blacking out low-contrast or blurry regions.
+    2. Applying adaptive thresholding.
 
-    def read_frame(self, idx: int) -> Optional[np.ndarray]:
-        if idx < 0 or idx >= self.frame_count:
-            return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        return frame
+    Args:
+        image (numpy.ndarray): OpenCV-loaded image.
+        block_size (int): Size of the region to check (pixels).
+        contrast_thresh (float): Contrast threshold (lower = blacked out).
+        blur_thresh (float): Laplacian variance threshold for blur.
+        adaptive_block (int): Block size for adaptive threshold (must be odd).
+        adaptive_C (int): Constant subtracted in adaptive threshold.
 
-    def release(self):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+    Returns:
+        numpy.ndarray: Processed binary image (after blackouts + thresholding).
+    """
+    output = image.copy()
+    h, w = image.shape[:2]
 
+    # Step 1: Blackout low-quality regions
+    for y in range(0, h, block_size):
+        for x in range(0, w, block_size):
+            roi = image[y:y+block_size, x:x+block_size]
+            if roi.size == 0:
+                continue
 
-def detect_using_rapidocr(img: np.ndarray):
-    """Run OCR with RapidOCR (onnxruntime). Returns list of dicts. Fallback to empty if engine missing."""
-    global _frame_counter
-    _frame_counter += 1
-    if _engine is None:
-        # Keep log low to avoid per-frame spam
-        return []
-    results, _ = _engine(img)
-    detections = []
-    if results:
-        for (box, text, score) in results:
-            detections.append({"box": box, "text": text, "score": float(score)})
-    return detections
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            I_max, I_min = np.max(gray), np.min(gray)
+            contrast = (I_max - I_min) / (I_max + I_min + 1e-5)
+            variance = cv2.Laplacian(gray, cv2.CV_64F).var()
 
+            if contrast < contrast_thresh or variance < blur_thresh:
+                output[y:y+block_size, x:x+block_size] = (0, 0, 0)
 
-def _to_ass_timestamp_from_seconds(seconds: float) -> str:
-    """Convert seconds to ASS H:MM:SS.CC format."""
-    total_ms = int(seconds * 1000)
-    hours = total_ms // 3600000
-    minutes = (total_ms % 3600000) // 60000
-    secs = (total_ms % 60000) // 1000
-    centiseconds = (total_ms % 1000) // 10
-    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+    # Step 2: Adaptive threshold
+    gray_full = cv2.cvtColor(output, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(
+        gray_full, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,  # or cv2.ADAPTIVE_THRESH_MEAN_C
+        cv2.THRESH_BINARY,
+        adaptive_block,
+        adaptive_C
+    )
 
+    return binary
 
-def _to_ass_timestamp_from_timedelta(start, end) -> Tuple[str, str]:
-    """Helper for srt.Subtitle start/end timedelta to ASS strings."""
-    return _to_ass_timestamp_from_seconds(start.total_seconds()), _to_ass_timestamp_from_seconds(end.total_seconds())
-
-
-def preprocess_adaptive_threshold(image: np.ndarray) -> np.ndarray:
-    """Prepare image for OCR using adaptive threshold (fast and robust enough)."""
+def preprocess_adaptive_threshold(image):
+    """Prepare image for OCR using adaptive threshold."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
+
+    # Adaptive thresholding
     thresh = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=11,
-        C=4,
+        gray, 
+        255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,  # or cv2.ADAPTIVE_THRESH_MEAN_C
+        cv2.THRESH_BINARY, 
+        blockSize=15,   # size of neighbourhood area (must be odd)
+        C=5             # constant subtracted from mean
     )
     return thresh
 
-
-def _avg_y_from_box(box) -> float:
-    arr = np.asarray(box, dtype=np.float32)
-    return float(arr[:, 1].mean()) if arr.size else 0.0
-
-
-def decide_subtitle_position(filtered_detections_list: List[List[dict]], frame_height: int, bottom_threshold_ratio: float = 0.75) -> str:
-    """Top if burnt-in detected in bottom region; else bottom."""
-    threshold_y = frame_height * bottom_threshold_ratio
-    for frame_dets in filtered_detections_list:
-        if not frame_dets:
-            continue
-        for det in frame_dets:
-            try:
-                if _avg_y_from_box(det["box"]) > threshold_y:
-                    return "top"
-            except Exception:
-                ys = [p[1] for p in det.get("box", [])]
-                if ys and (sum(ys) / len(ys)) > threshold_y:
+def decide_subtitle_position(filtered_detections_list, frame_height, bottom_threshold_ratio=0.75):
+    """Top if burnt-in detected in bottom, else bottom."""
+    for frame_detections in filtered_detections_list:
+        if frame_detections:
+            for det in frame_detections:
+                y_coords = [p[1] for p in det["box"]]
+                avg_y = sum(y_coords) / len(y_coords)
+                if avg_y > frame_height * bottom_threshold_ratio:
                     return "top"
     return "bottom"
 
-
-def _compute_frame_indices(start_frame: int, end_frame: int, min_samples: int, max_count: int) -> np.ndarray:
-    if start_frame > end_frame:
-        start_frame, end_frame = end_frame, start_frame
-    total = max(1, end_frame - start_frame + 1)
-    count = min(min_samples, total)
-    if count <= 1:
-        idx = np.array([start_frame], dtype=int)
-    else:
-        idx = np.linspace(start_frame, end_frame, count, dtype=int)
-    idx = np.clip(idx, 0, max(0, max_count - 1))
-    return np.unique(idx)
-
-
-def _decide_position_with_context(ctx: _VideoContext, start_sec: float, end_sec: float, min_frames: int = 3) -> str:
-    fps = ctx.fps
+def get_position_for_segment(video_path, start_sec, end_sec, min_frames=3):
+    """Run OCR on sampled frames to decide top/bottom."""
+    log.info("in get position for segment")
+    log.info(f"start sec:{start_sec},end_sec:{end_sec}")
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    
     start_frame = int(start_sec * fps)
     end_frame = int(end_sec * fps)
+    #---------------------dynamically assign min frames-----------------------------------
+    # total_frames_in_time_window = end_frame-start_frame+1
+    sub_time = end_sec-start_sec
+    # required_min_frames = int((0.05)*total_frames_in_time_window)
+    required_min_frames = int(sub_time)//2
+    min_frames = max(min_frames,required_min_frames)
+    log.info(f"required min frames is {required_min_frames}")
+    log.info(f"min frames now {min_frames}")
+    #---------------------dynamically assign min frames-----------------------------------
+    frame_indices = np.linspace(start_frame, end_frame, min(min_frames, abs(end_frame - start_frame + 1)), dtype=int)
 
-    # Dynamic sampling: proportional to segment length
-    sub_time = max(0.0, end_sec - start_sec)
-    required_min = max(min_frames, int(sub_time) // 2)
-
-    indices = _compute_frame_indices(start_frame, end_frame, required_min, ctx.frame_count)
-    filtered = []
-    for fi in indices:
-        frame = ctx.read_frame(int(fi))
-        if frame is None:
+    filtered_detections_per_frame = []
+    for frame_idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            log.info("could not obtain frame")
             continue
-        pre = preprocess_adaptive_threshold(frame)
-        dets = detect_using_rapidocr(pre)
-        filtered.append(dets)
-    return decide_subtitle_position(filtered, ctx.height)
+        # preprocessed = preprocess_threshold(frame)
+        preprocessed = preprocess_adaptive_threshold(frame)
+        # preprocessed = preprocess_using_blackout(frame)
+        # preprocessed = preprocess(frame)
+        # preprocessed = frame
+        detections = detect_using_rapidocr(preprocessed)
+        filtered_detections_per_frame.append(detections)
+    log.info(f"filtered detections per frame{filtered_detections_per_frame}")
+    cap.release()
 
+    return decide_subtitle_position(filtered_detections_per_frame, frame_height)
 
-@lru_cache(maxsize=4096)
-def _cached_position(video_path: str, start_sec: float, end_sec: float, min_frames: int) -> str:
-    """LRU cache to avoid recomputation for identical segments."""
-    ctx = _VideoContext(video_path)
-    try:
-        return _decide_position_with_context(ctx, start_sec, end_sec, min_frames)
-    finally:
-        ctx.release()
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def reposition_srt(video_path, srt_path, output_ass_path,results , min_frames=3, max_workers=5):
+    """Read SRT, run OCR in parallel (5 lines at a time), output ASS with repositioned alignment tags."""
+    subs = pysrt.open(srt_path)
 
-def get_position_for_segment(video_path, start_sec, end_sec, min_frames=3):
-    """Run OCR on sampled frames to decide top/bottom (cached)."""
-    log.info("get_position_for_segment: %s -> %s", start_sec, end_sec)
-    return _cached_position(video_path, float(start_sec), float(end_sec), int(min_frames))
-
-
-def _parse_srt_file(path: str) -> List[srt.Subtitle]:
-    with open(path, "r", encoding="utf-8-sig") as f:
-        contents = f.read()
-    return list(srt.parse(contents))
-
-
-def reposition_srt(video_path, srt_path, output_ass_path, results, min_frames=3, max_workers=5):
-    """Read SRT, apply provided positions, output ASS with repositioned alignment tags (no OCR here)."""
-    subs = _parse_srt_file(srt_path)
-
-    # Build quick index by subtitle index to avoid searching the list each time
-    index_to_sub = {i + 1: sub for i, sub in enumerate(subs)}
-
-    def process_sub(sub_index: int, position: str) -> Tuple[int, str]:
-        sub = index_to_sub.get(sub_index)
-        if sub is None:
-            return sub_index, ""
-        start_str, end_str = _to_ass_timestamp_from_timedelta(sub.start, sub.end)
+    def process_sub(sub_index,position):
+        """Process one subtitle line: run OCR on segment and decide position."""
+        sub = next((s for s in subs if s.index == sub_index), None)
+        log.info("sub obtained")
+        # start_sec = sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds + sub.start.milliseconds / 1000
+        # end_sec = sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds + sub.end.milliseconds / 1000
+        log.info(f"sub text:{sub.text}")
+        # position = get_position_for_segment(video_path, start_sec, end_sec, min_frames)
         alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
-        formatted_text = sub.content.replace("\n", r"\N")
-        line = f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{alignment_tag}{formatted_text}\n"
-        return sub_index, line
+        formatted_text = sub.text.replace("\n", r"\N")
+        line = (
+            f"Dialogue: 0,{to_ass_timestamp(sub.start)},{to_ass_timestamp(sub.end)},"
+            f"Default,,0,0,0,,{alignment_tag}{formatted_text}\n"
+        )
+        return line
 
-    # Submit only once per provided result entry
-    lines_out: Dict[int, str] = {}
-    workers = max(1, min(int(max_workers), 12))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_key = {}
-        for key in results:
-            entry = results[key]
-            sub_idx = entry.get("subtitle_index")
-            pos = entry.get("recommended_position")
-            if sub_idx is None or pos is None:
-                continue
-            fut = executor.submit(process_sub, int(sub_idx), str(pos))
-            fut_to_key[fut] = key
+    # Run OCR for multiple subtitles in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(process_sub,results[result].get('subtitle_index'),results[result].get('recommended_position')): i for i, result in enumerate(results)}
+        results = {}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                log.error(f"Error processing subtitle {idx}: {e}")
+                results[idx] = None
 
-        for fut in as_completed(fut_to_key):
-            idx, line = fut.result()
-            if line:
-                lines_out[idx] = line
-
+    # Write results back in correct order
     with open(output_ass_path, "w", encoding="utf-8") as f:
         f.write(
             "[Script Info]\n"
@@ -242,386 +304,731 @@ def reposition_srt(video_path, srt_path, output_ass_path, results, min_frames=3,
             "[Events]\n"
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
-        # preserve original order by iterating subs
-        for i, sub in enumerate(subs, start=1):
-            line = lines_out.get(i)
-            if line:
-                f.write(line)
-    log.info("Repositioned subtitle saved: %s", output_ass_path)
+        for i in range(len(subs)):
+            if results[i]:
+                f.write(results[i])
+
+    log.info(f"Repositioned subtitle saved: {output_ass_path}")
     return output_ass_path
 
+# def reposition_ass(video_path, ass_path, output_ass_path , max_workers = 5):
+#     """Modify only alignment tags in ASS/SSA dialogue lines."""
+#     # with open(ass_path, "r", encoding="utf-8") as fin, open(output_ass_path, "w", encoding="utf-8") as fout:
+#     #     for line in fin:
+#     def process_sub(line:str):
+#             if line.startswith("Dialogue:"):
+#                 # Parse times from Dialogue line
+#                 m = re.match(r"Dialogue: \d+,(.*?),(.*?),", line)
+#                 if m:
+#                     # log.info("found dialogue")
+#                     start_str, end_str = m.groups()
+#                     # Convert ASS time to seconds
+#                     def ass_time_to_sec(ts):
+#                         h, m_, s_cs = ts.split(":")
+#                         s, cs = s_cs.split(".")
+#                         return int(h)*3600 + int(m_)*60 + int(s) + int(cs)/100
+#                     start_sec = ass_time_to_sec(start_str)
+#                     end_sec = ass_time_to_sec(end_str)
+#                     print(line)
+#                     matches = re.search(r"Dialogue: \d+,[0-9]:[0-9]{2}:[0-9]{2}.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,(?:.*)?,(?:\{\\an\d\})?(.*)",line)
+#                     # if matches:
+#                     #     print("found matches")
+#                     #     log.info(matches.groups())
 
-def reposition_ass(ass_path, results, output_ass_path, max_workers=5):
-    """Modify only alignment tags in ASS dialogue lines using precomputed detection results."""
-    with open(ass_path, "r", encoding="utf-8") as f:
-        input_lines = f.read().splitlines()
-    output_lines = list(input_lines)
+#                     # else:
+#                     #     print("no matches")
+#                     sub_text = matches.groups()[0]
+#                     log.info(f"sub text:{sub_text}")
+#                     position = get_position_for_segment(video_path, start_sec, end_sec)
+#                     alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
+#                     # Replace or insert alignment tag
+#                     if re.search(r"\{\\an\d\}", line):                        
+#                         line = re.sub(r"\{\\an\d\}", alignment_tag, line)
+#                     else:
+#                         line = line.rstrip("\n") + alignment_tag
+#                     log.info(f"finished for sub {sub_text}")
+#                 #     return line
+#                 # else:
+#                 #     return line
+#             return line
+#     with open(ass_path,'r') as f:
+#         input_ass_file = f.read()
+#         log.info(f"input_ass_file:\n{input_ass_file}")
+#     # for line in input_ass_file.splitlines():
+#     #     log.info(f"line:\n{line}")
+#     #     processed_line = process_sub(line)
+#     #     log.info(f"processed line:\n{processed_line}")
+#     with ThreadPoolExecutor(max_workers=5) as executor:
+#         futures = [executor.submit(process_sub,line) for line in input_ass_file.splitlines()]
+#         results = []
+#         for i , future in enumerate(futures):
+#             try:
+#                 result = future.result()
+#                 # if result:
+#                 log.info(f"original : {input_ass_file.splitlines()[i]}")
+#                 log.info(f"result : {result}")
+#                 results.append(result)
+#             except:
+#                 log.error(f"Error processing line:{input_ass_file.splitlines()[i]}")
+#         log.info(f"results: {results}")
+#     if results:
+#         new_ass_file = "\n".join(results)
+#     else:
+#         new_ass_file = ""
+#     log.info(new_ass_file)
+#     open(output_ass_path,"w",encoding="utf-8").write(new_ass_file)
+import traceback
+def reposition_ass(ass_path, results, output_ass_path, max_workers = 5):
+    """Modify only alignment tags in ASS/SSA dialogue lines."""
+    # with open(ass_path, "r", encoding="utf-8") as fin, open(output_ass_path, "w", encoding="utf-8") as fout:
+    #     for line in fin:
+    with open(ass_path,'r') as f:
+        input_ass_file = f.read()
+        input_ass_file = input_ass_file.splitlines()
+        log.info(f"input_ass_file:\n{input_ass_file}")
+    output_ass_file = input_ass_file
+    def process_sub(sub_index,position):
+            line = input_ass_file[sub_index]
+            if line.startswith("Dialogue:"):
+                # Parse times from Dialogue line
+                m = re.match(r"Dialogue: \d+,(.*?),(.*?),", line)
+                if m:
+                    # log.info("found dialogue")
+                    start_str, end_str = m.groups()
+                    # Convert ASS time to seconds
+                    def ass_time_to_sec(ts):
+                        h, m_, s_cs = ts.split(":")
+                        s, cs = s_cs.split(".")
+                        return int(h)*3600 + int(m_)*60 + int(s) + int(cs)/100
+                    start_sec = ass_time_to_sec(start_str)
+                    end_sec = ass_time_to_sec(end_str)
+                    print(line)
+                    matches = re.search(r"Dialogue: \d+,[0-9]:[0-9]{2}:[0-9]{2}.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,(?:.*)?,(?:\{\\an\d\})?(.*)",line)
+                    # if matches:
+                    #     print("found matches")
+                    #     log.info(matches.groups())
 
-    def process_by_index(sub_index: int, position: str) -> Tuple[int, str]:
-        if sub_index < 0 or sub_index >= len(input_lines):
-            return sub_index, ""
-        line = input_lines[sub_index]
-        if line.startswith("Dialogue:"):
-            if re.search(r"\{\\an\d\}", line):
-                line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
-            else:
-                line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
-        return sub_index, line
+                    # else:
+                    #     print("no matches")
+                    sub_text = matches.groups()[0]
+                    log.info(f"sub text:{sub_text}")
+                    # position = get_position_for_segment(video_path, start_sec, end_sec)
+                    # alignment_tag = r"{\\an8}" if position == "top" else r"{\\an2}"
+                    # Replace or insert alignment tag
+                    if re.search(r"\{\\an\d\}", line):                        
+                        line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
+                    else:
+                        line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
+                    log.info(f"finished for sub {sub_text}")
+                    output_ass_file[sub_index]=line
+                #     return line
+                # else:
+                #     return line
+            return line
 
-    workers = max(1, min(int(max_workers), 12))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_key = {}
-        for key, entry in results.items():
-            sub_idx = entry.get("subtitle_index")
-            pos = entry.get("recommended_position")
-            if sub_idx is None or pos is None:
-                continue
-            fut = executor.submit(process_by_index, int(sub_idx), str(pos))
-            fut_to_key[fut] = key
-
-        for fut in as_completed(fut_to_key):
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # futures = [executor.submit(process_sub,line) for line in input_ass_file.splitlines()]
+        future_to_idx = {
+            executor.submit(process_sub,results[result].get('subtitle_index'),results[result].get('recommended_position')):results[result].get('subtitle_index')  \
+                for i,result in enumerate(results)}
+        for future in as_completed(future_to_idx):
+            i= future_to_idx[future]
             try:
-                idx, new_line = fut.result()
-                if new_line:
-                    output_lines[idx] = new_line
+                result = future.result()
+                # if result:
+                log.info(f"original [{i}] : {input_ass_file[i]}")
+                log.info(f"result [{i}] : {result}")
+                output_ass_file[int(i)] = result
+                log.info(f"completed[{i}]")
+                # results.append(result)
             except Exception as e:
-                log.error("Error updating ASS line for key %s: %s", fut_to_key[fut], e, exc_info=True)
+                log.error(f"Error processing line '{input_ass_file[i]}',Error:{e}")
+                traceback.print_exc()
+        # log.info(f"results: {results}")
+        log.info(f"output_ass_file:{output_ass_file}")
+    if output_ass_file:
+        new_ass_file = "\n".join(output_ass_file)
+    else:
+        new_ass_file = ""
+    log.info(new_ass_file)
+    open(output_ass_path,"w",encoding="utf-8").write(new_ass_file)
 
-    new_text = "\n".join(output_lines)
-    with open(output_ass_path, "w", encoding="utf-8") as fo:
-        fo.write(new_text)
+        
 
 
-def reposition_ssa(ssa_path, results, output_ssa_path, max_workers=5):
-    """Modify only alignment tags in SSA dialogue lines using precomputed detection results."""
-    with open(ssa_path, "r", encoding="utf-8") as f:
-        input_lines = f.read().splitlines()
-    output_lines = list(input_lines)
+# def reposition_ssa(video_path, ssa_path, output_ssa_path):
+#     """Modify only alignment tags in ASS/SSA dialogue lines."""
+#     with open(ssa_path, "r", encoding="utf-8") as fin, open(output_ssa_path, "w", encoding="utf-8") as fout:
+#         for line in fin:
+#             if line.startswith("Dialogue:"):
+#                 # Parse times from Dialogue line
+#                 m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
+#                 if m:
+#                     start_str, end_str = m.groups()
+#                     # Convert ASS time to seconds
+#                     def ssa_time_to_sec(ts):
+#                         h, m_, s_cs = ts.split(":")
+#                         s, cs = s_cs.split(".")
+#                         return int(h)*3600 + int(m_)*60 + int(s) + int(cs)/100
+#                     start_sec = ssa_time_to_sec(start_str)
+#                     end_sec = ssa_time_to_sec(end_str)
+#                     matches = re.search(r"Dialogue: \d+,[0-9]:[0-9]{2}:[0-9]{2}.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}.\d+,Default,,\d,\d,\d,,\{\\an\d\}(.*)\n",line)
+#                     sub_text = matches.groups()[0]
+#                     log.info(f"sub text:{sub_text}")
+#                     position = get_position_for_segment(video_path, start_sec, end_sec)
+#                     alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
+#                     # Replace or insert alignment tag
+#                     if re.search(r"{\an\d}", line):
+                        
+#                         line = re.sub(r"{\an\d}", alignment_tag, line)
+#                     else:
+#                         line = line.rstrip("\n") + alignment_tag + "\n"
+#             fout.write(line)
+# def reposition_ssa(video_path, ssa_path, output_ssa_path , max_workers =5 ):
+#     """Modify only alignment tags in SSA dialogue lines."""
 
-    def process_by_index(sub_index: int, position: str) -> Tuple[int, str]:
-        if sub_index < 0 or sub_index >= len(input_lines):
-            return sub_index, ""
-        line = input_lines[sub_index]
+#     def process_sub(line: str):
+#         if line.startswith("Dialogue:"):
+#             # Parse times from Dialogue line
+#             m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
+#             if m:
+#                 start_str, end_str = m.groups()
+
+#                 # Convert SSA time to seconds
+#                 def ssa_time_to_sec(ts):
+#                     h, m_, s_cs = ts.split(":")
+#                     s, cs = s_cs.split(".")
+#                     return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
+
+#                 start_sec = ssa_time_to_sec(start_str)
+#                 end_sec = ssa_time_to_sec(end_str)
+
+#                 # Capture subtitle text (with optional alignment tag)
+#                 matches = re.search(
+#                     r"Dialogue: Marked=\d+,[0-9]:[0-9]{2}:[0-9]{2}\.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}\.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,,(?:\{\\an\d\})?(.*)",
+#                     line
+#                 )
+#                 if matches:
+#                     sub_text = matches.groups()[0]
+#                     log.info(f"sub text: {sub_text}")
+
+#                     position = get_position_for_segment(video_path, start_sec, end_sec)
+#                     alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
+
+#                     # Replace or insert alignment tag
+#                     if re.search(r"\{\\an\d\}", line):
+#                         line = re.sub(r"\{\\an\d\}", alignment_tag, line)
+#                     else:
+#                         line = line.rstrip("\n") + alignment_tag
+#                     log.info(f"finished for sub {sub_text}")
+#         return line
+
+#     with open(ssa_path, 'r', encoding="utf-8") as f:
+#         input_ssa_file = f.read()
+#         log.info(f"input_ssa_file:\n{input_ssa_file}")
+
+#     with ThreadPoolExecutor(max_workers=5) as executor:
+#         futures = [executor.submit(process_sub, line) for line in input_ssa_file.splitlines()]
+#         results = []
+#         for i, future in enumerate(futures):
+#             try:
+#                 result = future.result()
+#                 log.info(f"original : {input_ssa_file.splitlines()[i]}")
+#                 log.info(f"result   : {result}")
+#                 results.append(result)
+#             except:
+#                 log.error(f"Error processing line: {input_ssa_file.splitlines()[i]}")
+
+#     new_ssa_file = "\n".join(results) if results else ""
+#     log.info(new_ssa_file)
+
+#     with open(output_ssa_path, "w", encoding="utf-8") as f:
+#         f.write(new_ssa_file)
+def reposition_ssa(ssa_path,results, output_ssa_path , max_workers =5):
+    """Modify only alignment tags in SSA dialogue lines."""
+    with open(ssa_path, 'r', encoding="utf-8") as f:
+        input_ssa_file = f.read()
+        input_ssa_file = input_ssa_file.splitlines()
+        log.info(f"input_ssa_file:\n{input_ssa_file}")
+    output_ssa_file = input_ssa_file
+    def process_sub(sub_index,position):
+        line = input_ssa_file[sub_index]
         if line.startswith("Dialogue:"):
-            if re.search(r"\{\\an\d\}", line):
-                line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
-            else:
-                line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
-        return sub_index, line
+            # Parse times from Dialogue line
+            
+            m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
+            if m:
+                start_str, end_str = m.groups()
 
-    workers = max(1, min(int(max_workers), 12))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_key = {}
-        for key, entry in results.items():
-            sub_idx = entry.get("subtitle_index")
-            pos = entry.get("recommended_position")
-            if sub_idx is None or pos is None:
-                continue
-            fut = executor.submit(process_by_index, int(sub_idx), str(pos))
-            fut_to_key[fut] = key
+                # Convert SSA time to seconds
+                def ssa_time_to_sec(ts):
+                    h, m_, s_cs = ts.split(":")
+                    s, cs = s_cs.split(".")
+                    return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
 
-        for fut in as_completed(fut_to_key):
+                start_sec = ssa_time_to_sec(start_str)
+                end_sec = ssa_time_to_sec(end_str)
+
+                # Capture subtitle text (with optional alignment tag)
+                matches = re.search(
+                    r"Dialogue: Marked=\d+,[0-9]:[0-9]{2}:[0-9]{2}\.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}\.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,,(?:\{\\an\d\})?(.*)",
+                    line
+                )
+                if matches:
+                    sub_text = matches.groups()[0]
+                    log.info(f"sub text: {sub_text}")
+
+                    # position = get_position_for_segment(video_path, start_sec, end_sec)
+                    # alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
+
+                    # Replace or insert alignment tag
+                    if re.search(r"\{\\an\d\}", line):
+                        line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
+                    else:
+                        line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
+                    log.info(f"finished for sub {sub_text}")
+        return line
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # futures = [executor.submit(process_sub, line) for line in input_ssa_file.splitlines()]
+        future_as_idx =  { executor.submit(process_sub,results[result].get("subtitle_index"),results[result].get('recommended_position')):results[result].get('subtitle_index') for result in results}
+        # results = []
+        for future in as_completed(future_as_idx):
+            i = future_as_idx[future]
             try:
-                idx, updated_line = fut.result()
-                if updated_line:
-                    output_lines[idx] = updated_line
+                result = future.result()
+                log.info(f"original[{i}] : {input_ssa_file[i]}")
+                log.info(f"result [{i}] : {result}")
+                output_ssa_file[i] = result
             except Exception as e:
-                log.error("Error updating SSA line for key %s: %s", fut_to_key[fut], e, exc_info=True)
+                log.error(f"Error processing line: {input_ssa_file[i]}: {e}")
 
-    new_text = "\n".join(output_lines)
+    new_ssa_file = "\n".join(output_ssa_file) if results else ""
+    log.info(new_ssa_file)
+
     with open(output_ssa_path, "w", encoding="utf-8") as f:
-        f.write(new_text)
+        f.write(new_ssa_file)
 
-
-def reposition_vtt(vtt_path, results, output_vtt_path, max_workers=5):
-    """For VTT: modify 'line:' cue position using precomputed detection results."""
+# def reposition_vtt(video_path, vtt_path, output_vtt_path):
+#     """For VTT: modify 'line:' cue position."""
+#     log.info("repositioning vtt file")
+#     with open(vtt_path, "r", encoding="utf-8") as fin, open(output_vtt_path, "w", encoding="utf-8") as fout:
+#         cue_times = None
+#         for line in fin:
+#             log.info(f"line:{line}")
+#             if "-->" in line:
+#                 cue_times = line
+#                 # Extract start/end times
+#                 start_str, end_str = line.split("-->")
+#                 start_sec = sum(float(x) * 60 ** (i-1) if not i==0 else float(x)/1000 for i, x in enumerate(reversed(start_str.strip().replace('.', ':').split(":"))))
+#                 end_sec = sum(float(x) * 60 ** (i-1) if not i==0 else float(x)/1000 for i, x in enumerate(reversed(end_str.strip().replace('.', ':').split(":"))))
+#                 position = get_position_for_segment(video_path, start_sec, end_sec)
+#                 log.info(f"decided position:{position}")
+#                 if "line:" in line:
+#                     log.info("in if")
+#                     line = re.sub(r"line:\d+", "line:0%" if position == "top" else "line:80%", line)
+#                 else:
+#                     log.info("in else")
+#                     line = line.strip() + ("line:0%\n" if position == "top" else " line:80%\n")
+#             fout.write(line)
+def reposition_vtt( vtt_path, results, output_vtt_path , max_workers = 5):
+    """For VTT: modify 'line:' cue position like ASS/SSA alignment."""
+    log.info("repositioning vtt file")
     with open(vtt_path, "r", encoding="utf-8") as f:
-        input_lines = f.read().splitlines()
-    output_lines = list(input_lines)
+        input_vtt_file = f.read()
+        input_vtt_file=input_vtt_file.splitlines()
+        log.info(f"input_vtt_file:\n{input_vtt_file}")
+    output_vtt_file = input_vtt_file
+    def vtt_time_to_sec(ts: str) -> float:
+        # VTT timestamps are usually: hh:mm:ss.mmm or mm:ss.mmm
+        hms = ts.strip().split(":")
+        if len(hms) == 3:  # hh:mm:ss.mmm
+            h, m, s_ms = hms
+        else:  # mm:ss.mmm
+            h, m, s_ms = 0, *hms
+        s, ms = s_ms.split(".")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    def extract_timestamps_string(line):
+        matches = re.search(r"(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{1,3})",line)
+        # log.info(f"groups:{matches.groups()}")
+        # log.info(f"group [0]:{matches.group(1)}")
+        # log.info(f"group [1]:{matches.group(2)}")
+        start_str = matches.group(1)
+        end_str = matches.group(2)
+        return start_str , end_str
+    def process_sub(sub_index,position):
+        line = input_vtt_file[sub_index]
+        if "-->" in line:  # This is a cue timing line
+            # start_str, end_str = line.split("-->")
+            # log.info(f"start_str : {start_str} , end_str : {end_str}")
+            start_str , end_str = extract_timestamps_string(line)
+            log.info(f"start_str_new : {start_str} , end_str_new : {end_str}")
+            start_sec = vtt_time_to_sec(start_str)
+            end_sec = vtt_time_to_sec(end_str)
 
-    def process_by_index(sub_index: int, position: str) -> Tuple[int, str]:
-        if sub_index < 0 or sub_index >= len(input_lines):
-            return sub_index, ""
-        line = input_lines[sub_index]
-        if "-->" in line:
+            # position = get_position_for_segment(video_path, start_sec, end_sec)
+            log.info(f"decided position: {position}")
             if "line:" in line:
-                line = re.sub(r"line:\d+%?", "line:0%" if position == "top" else "line:80%", line)
+                line = re.sub(r"line:\d+%?", 
+                              "line:0%" if position == "top" else "line:80%", 
+                              line)
             else:
-                line = line.strip() + (" line:0%" if position == "top" else " line:80%")
-        return sub_index, line
+                line = line.strip() + (r" line:0%" if position == "top" else r" line:80%")
+        return line
 
-    workers = max(1, min(int(max_workers), 12))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_key = {}
-        for key, entry in results.items():
-            sub_idx = entry.get("subtitle_index")
-            pos = entry.get("recommended_position")
-            if sub_idx is None or pos is None:
-                continue
-            fut = executor.submit(process_by_index, int(sub_idx), str(pos))
-            fut_to_key[fut] = key
-
-        for fut in as_completed(fut_to_key):
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # futures = [executor.submit(process_sub, line) for line in input_vtt_file.splitlines()]
+        future_as_idx = {executor.submit(process_sub,results[result].get("subtitle_index"),results[result].get("recommended_position")):results[result].get("subtitle_index") for result in results}
+        
+        for future in as_completed(future_as_idx):
+            i = future_as_idx[future]
             try:
-                idx, new_line = fut.result()
-                if new_line:
-                    output_lines[idx] = new_line
+                result = future.result()
+                log.info(f"original [{i}] : {input_vtt_file[i]}")
+                log.info(f"result  [{i}] : {result}")
+                output_vtt_file[i] = result 
             except Exception as e:
-                log.error("Error updating VTT line for key %s: %s", fut_to_key[fut], e, exc_info=True)
+                log.error(f"Error processing line: {input_vtt_file[i]} ({e})")
+                log.error("error occured:",exc_info=True)
 
-    new_text = "\n".join(output_lines)
+    new_vtt_file = "\n".join(output_vtt_file) if output_vtt_file else ""
+    log.info(new_vtt_file)
+
     with open(output_vtt_path, "w", encoding="utf-8") as f:
-        f.write(new_text)
+        f.write(new_vtt_file)
+# import time
+# def process_subtitle(video_path, subtitle_path, max_workers = 12):
+#     start = time.time()
+#     ext = os.path.splitext(subtitle_path)[1].lower()
+    
+#     if ext == ".srt":
+#         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
+#         reposition_srt(video_path, subtitle_path, output_file ,max_workers=max_workers)
+#     # elif ext in [".ass", ".ssa"]:
+#     #     output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
+#     #     reposition_ass(video_path, subtitle_path, output_file)
+#     elif ext ==".ass":
+#         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
+#         reposition_ass(video_path, subtitle_path, output_file, max_workers=max_workers)
+#     elif ext == ".ssa":
+#         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ssa"
+#         reposition_ssa(video_path, subtitle_path, output_file, max_workers=max_workers)
+#     elif ext == ".vtt":
+#         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.vtt"
+#         reposition_vtt(video_path, subtitle_path, output_file, max_workers=max_workers)
+#     else:
+#         raise ValueError(f"Unsupported subtitle format: {ext}")
 
-
-def _srt_time_to_seconds(sub: srt.Subtitle) -> Tuple[float, float]:
-    return float(sub.start.total_seconds()), float(sub.end.total_seconds())
-
+#     log.info(f"Repositioned subtitle saved: {output_file}")
+#     print(f"Repositioned subtitle saved: {output_file}")
+#     end = time.time()
+#     print("total time taken",end-start)
+#     return output_file
+#----------------------------------------------------printing out detections---------------------------------------------------
 
 def get_detections(video_path, start_sec, end_sec, min_frames=3):
-    """Run OCR on sampled frames, return per-frame analysis and recommended position."""
-    ctx = _VideoContext(video_path)
-    try:
-        fps = ctx.fps
-        start_frame = int(start_sec * fps)
-        end_frame = int(end_sec * fps)
-        sub_time = max(0.0, end_sec - start_sec)
-        required_min = max(int(min_frames), int(sub_time) // 2)
-        indices = _compute_frame_indices(start_frame, end_frame, required_min, ctx.frame_count)
-        analysis = []
-        filtered = []
-        for fi in indices:
-            entry = {"frame_index": int(fi), "timestamp": float(fi / fps), "detections": []}
-            frame = ctx.read_frame(int(fi))
-            if frame is None:
-                analysis.append(entry)
-                continue
-            pre = preprocess_adaptive_threshold(frame)
-            dets = detect_using_rapidocr(pre)
-            filtered.append(dets)
-            entry["detections"] = dets
-            analysis.append(entry)
-        recommended = decide_subtitle_position(filtered, ctx.height)
-        return {"analysis": analysis, "recommended_position": recommended}
-    finally:
-        ctx.release()
-
+    """Run OCR on sampled frames to decide top/bottom."""
+    log.info("in get position for segment")
+    log.info(f"start sec:{start_sec},end_sec:{end_sec}")
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))       
+    start_frame = int(start_sec * fps)
+    end_frame = int(end_sec * fps)
+    #---------------------dynamically assign min frames-----------------------------------
+    sub_time = end_sec-start_sec
+    required_min_frames = int(sub_time)//2
+    min_frames = max(min_frames,required_min_frames)
+    #---------------------dynamically assign min frames-----------------------------------
+    frame_indices = np.linspace(start_frame, end_frame, min(min_frames, abs(end_frame - start_frame + 1)), dtype=int)
+    analysis = []
+    filtered_detections_per_frame = []
+    for frame_idx in frame_indices:
+        result = {}
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            log.info("could not obtain frame")
+            continue
+        preprocessed = preprocess_adaptive_threshold(frame)
+        detections = detect_using_rapidocr(preprocessed)
+        filtered_detections_per_frame.append(detections)
+        result["frame_index"] = int(frame_idx)
+        result["timestamp"] = float(frame_idx/fps)
+        result["detections"] = detections
+        analysis.append(result)
+    log.info(f"filtered detections per frame{filtered_detections_per_frame}")
+    cap.release()
+    recommended_position= decide_subtitle_position(filtered_detections_per_frame, frame_height)
+    d = {"analysis":analysis,"recommended_position":recommended_position}
+    return d
 
 def detect_text_srt(video_path, srt_path, min_frames=3, max_workers=5):
-    """Analyze SRT cues and compute recommended positions using OCR (parallelized)."""
-    subs = _parse_srt_file(srt_path)
+    """Read SRT, run OCR in parallel (5 lines at a time), output ASS with repositioned alignment tags."""
+    subs = pysrt.open(srt_path)
+    def process_sub(sub,sub_index):
+        """Process one subtitle line: run OCR on segment and decide position."""
+        start_sec = sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds + sub.start.milliseconds / 1000
+        end_sec = sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds + sub.end.milliseconds / 1000
+        log.info(f"sub text:{sub.text}")
+        detections = get_detections(video_path,start_sec,end_sec,min_frames)
+        detections["subtitle_index"]=sub_index
+        log.info(f"detections{detections}")
+        return detections
 
-    def process_sub(sub: srt.Subtitle, sub_index: int):
-        start_sec, end_sec = _srt_time_to_seconds(sub)
-        log.info("sub text: %s", sub.content)
-        det = get_detections(video_path, start_sec, end_sec, min_frames)
-        det["subtitle_index"] = sub_index
-        log.info("detections%s", det)
-        return det
-
-    workers = max(1, min(int(max_workers), 12))
-    results: Dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_idx = {executor.submit(process_sub, sub, i + 1): i for i, sub in enumerate(subs)}
-        for fut in as_completed(fut_to_idx):
-            idx = fut_to_idx[fut]
-            try:
-                results[idx] = fut.result()
+    # Run OCR for multiple subtitles in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(process_sub, sub ,sub.index): i for i, sub in enumerate(subs)}
+        results = {}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:                
+                results[idx] = future.result()
+                log.info("retrieved result")
             except Exception as e:
-                log.error("Error processing subtitle %s: %s", idx, e)
-                results[idx] = None  # keep structure consistent
+                log.error(f"Error processing subtitle {idx}: {e}")
+                results[idx] = None
     return results
 
 
-def _ass_time_to_sec(ts: str) -> float:
-    h, m_, s_cs = ts.split(":")
-    s, cs = s_cs.split(".")
-    return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
 
-
-def detect_text_ass(video_path, ass_path, max_workers=5):
-    """Compute detections for ASS Dialogue lines."""
-    def process_line(line: str):
-        if not line.startswith("Dialogue:"):
-            return None
-        m = re.match(r"Dialogue: \d+,(.*?),(.*?),", line)
-        if not m:
-            return None
-        start_str, end_str = m.groups()
-        start_sec = _ass_time_to_sec(start_str)
-        end_sec = _ass_time_to_sec(end_str)
-        det = get_detections(video_path, start_sec, end_sec)
-        return det
-
-    with open(ass_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    lines = content.splitlines()
-
-    workers = max(1, min(int(max_workers), 12))
-    results: Dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_idx = {executor.submit(process_line, line): i for i, line in enumerate(lines)}
-        for fut in as_completed(fut_to_idx):
-            i = fut_to_idx[fut]
+# import traceback
+def detect_text_ass(video_path, ass_path, max_workers = 5):
+    """Modify only alignment tags in ASS/SSA dialogue lines."""
+    def process_sub(line:str,sub_index):
+            if line.startswith("Dialogue:"):
+                # Parse times from Dialogue line
+                m = re.match(r"Dialogue: \d+,(.*?),(.*?),", line)
+                if m:
+                    # log.info("found dialogue")
+                    start_str, end_str = m.groups()
+                    # Convert ASS time to seconds
+                    def ass_time_to_sec(ts):
+                        h, m_, s_cs = ts.split(":")
+                        s, cs = s_cs.split(".")
+                        return int(h)*3600 + int(m_)*60 + int(s) + int(cs)/100
+                    start_sec = ass_time_to_sec(start_str)
+                    end_sec = ass_time_to_sec(end_str)
+                    # print(line)
+                    matches = re.search(r"Dialogue: \d+,[0-9]:[0-9]{2}:[0-9]{2}.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,(?:.*)?,(?:\{\\an\d\})?(.*)",line)
+                    sub_text = matches.groups()[0]
+                    log.info(f"sub text:{sub_text}")
+                    detections = get_detections(video_path, start_sec, end_sec)
+                    detections["subtitle_index"] = sub_index
+                    return detections
+                else:
+                    return None
+    with open(ass_path,'r') as f:
+        input_ass_file = f.read()
+        log.info(f"input_ass_file:\n{input_ass_file}")
+    # output_ass_file = input_ass_file.splitlines()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(process_sub,line,i):i 
+            for i,line in enumerate(input_ass_file.splitlines())
+            }
+        results = {}
+        for future in as_completed(future_to_idx):
+            i= future_to_idx[future]
             try:
-                det = fut.result()
-                if det:
-                    results[i] = det
+                result = future.result()
+                # if result:
+                log.info(f"original [{i}] : {input_ass_file.splitlines()[i]}")
+                log.info(f"result [{i}] : {result}")
+                if result:
+                    results[i] = result
+                log.info(f"completed[{i}]")
+                # results.append(result)
             except Exception as e:
-                log.error("Error processing line [%s]: %s", i, e, exc_info=True)
+                log.error(f"Error processing line '{input_ass_file.splitlines()[i]}',Error:{e}")
+                traceback.print_exc()
     return results
 
+        
+def detect_text_ssa(video_path, ssa_path,  max_workers =5 ):
+    """Modify only alignment tags in SSA dialogue lines."""
 
-def _ssa_time_to_sec(ts: str) -> float:
-    h, m_, s_cs = ts.split(":")
-    s, cs = s_cs.split(".")
-    return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
+    def process_sub(line: str,sub_index):
+        if line.startswith("Dialogue:"):
+            # Parse times from Dialogue line
+            m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
+            if m:
+                start_str, end_str = m.groups()
 
+                # Convert SSA time to seconds
+                def ssa_time_to_sec(ts):
+                    h, m_, s_cs = ts.split(":")
+                    s, cs = s_cs.split(".")
+                    return int(h) * 3600 + int(m_) * 60 + int(s) + int(cs) / 100
 
-def detect_text_ssa(video_path, ssa_path, max_workers=5):
-    """Compute detections for SSA Dialogue lines."""
-    def process_line(line: str):
-        if not line.startswith("Dialogue:"):
+                start_sec = ssa_time_to_sec(start_str)
+                end_sec = ssa_time_to_sec(end_str)
+
+                # Capture subtitle text (with optional alignment tag)
+                matches = re.search(
+                    r"Dialogue: Marked=\d+,[0-9]:[0-9]{2}:[0-9]{2}\.\d+,[0-9]{1,2}:[0-9]{2}:[0-9]{2}\.\d+,(?:Default)?,(?:.*)?,\d+,\d+,\d+,,(?:\{\\an\d\})?(.*)",
+                    line
+                )
+                if matches:
+                    sub_text = matches.groups()[0]
+                    log.info(f"sub text: {sub_text}")
+
+                    detections = get_detections(video_path, start_sec, end_sec)
+                    detections["subtitle_index"]=sub_index
+                    return detections
+                else:
+                    return None
+        else:
             return None
-        m = re.match(r"Dialogue: Marked=\d+,(.*?),(.*?),", line)
-        if not m:
-            return None
-        start_str, end_str = m.groups()
-        start_sec = _ssa_time_to_sec(start_str)
-        end_sec = _ssa_time_to_sec(end_str)
-        det = get_detections(video_path, start_sec, end_sec)
-        return det
 
-    with open(ssa_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    lines = content.splitlines()
-
-    workers = max(1, min(int(max_workers), 12))
-    results: Dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_idx = {executor.submit(process_line, line): i for i, line in enumerate(lines)}
-        for fut in as_completed(fut_to_idx):
-            i = fut_to_idx[fut]
+    with open(ssa_path, 'r', encoding="utf-8") as f:
+        input_ssa_file = f.read()
+        log.info(f"input_ssa_file:\n{input_ssa_file}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # futures = [executor.submit(process_sub, line) for line in input_ssa_file.splitlines()]
+        future_as_idx =  { executor.submit(process_sub,line,i):i for i,line in enumerate(input_ssa_file.splitlines())}
+        results = {}
+        k=0
+        for future in as_completed(future_as_idx):
+            i = future_as_idx[future]
             try:
-                det = fut.result()
-                if det:
-                    results[i] = det
-            except Exception:
-                log.error("Error processing line: %s", lines[i])
+                result = future.result()
+                log.info(f"original[{i}] : {input_ssa_file.splitlines()[i]}")
+                log.info(f"result [{i}] : {result}")
+                if result:
+                    results[k] = result
+                    k+=1
+            except:
+                log.error(f"Error processing line: {input_ssa_file.splitlines()[i]}")
     return results
 
-
-def _vtt_time_to_sec(ts: str) -> float:
-    parts = ts.strip().split(":")
-    if len(parts) == 3:
-        h, m, s_ms = parts
-    else:
-        h, m, s_ms = 0, *parts
-    s, ms = s_ms.split(".")
-    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
-
-
-def detect_text_vtt(video_path, vtt_path, max_workers=5):
-    """Compute detections for VTT cue lines."""
-    def extract_ts(line: str):
-        m = re.search(r"(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{1,3})", line)
-        if not m:
-            return None
-        return m.group(1), m.group(2)
-
-    def process_line(line: str):
-        if "-->" not in line:
-            return None
-        ts = extract_ts(line)
-        if not ts:
-            return None
-        start_str, end_str = ts
-        start_sec = _vtt_time_to_sec(start_str)
-        end_sec = _vtt_time_to_sec(end_str)
-        det = get_detections(video_path, start_sec, end_sec)
-        return det
+def detect_text_vtt(video_path, vtt_path, max_workers = 5):
+    """For VTT: modify 'line:' cue position like ASS/SSA alignment."""
+    log.info("repositioning vtt file")
+    min_frames = 3
+    def vtt_time_to_sec(ts: str) -> float:
+        # VTT timestamps are usually: hh:mm:ss.mmm or mm:ss.mmm
+        hms = ts.strip().split(":")
+        if len(hms) == 3:  # hh:mm:ss.mmm
+            h, m, s_ms = hms
+        else:  # mm:ss.mmm
+            h, m, s_ms = 0, *hms
+        s, ms = s_ms.split(".")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    def extract_timestamps_string(line):
+        matches = re.search(r"(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{1,3})",line)
+        # log.info(f"groups:{matches.groups()}")
+        # log.info(f"group [0]:{matches.group(1)}")
+        # log.info(f"group [1]:{matches.group(2)}")
+        start_str = matches.group(1)
+        end_str = matches.group(2)
+        return start_str , end_str
+    def process_sub(line: str,sub_index):
+        if "-->" in line:  # This is a cue timing line
+            # start_str, end_str = line.split("-->")
+            # log.info(f"start_str : {start_str} , end_str : {end_str}")
+            start_str , end_str = extract_timestamps_string(line)
+            log.info(f"start_str_new : {start_str} , end_str_new : {end_str}")
+            start_sec = vtt_time_to_sec(start_str)
+            end_sec = vtt_time_to_sec(end_str)
+            detections = get_detections(video_path,start_sec,end_sec,min_frames) 
+            detections["subtitle_index"]=sub_index
+            return detections
+        return None           
 
     with open(vtt_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    lines = content.splitlines()
-
-    workers = max(1, min(int(max_workers), 12))
-    results: Dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        fut_to_idx = {executor.submit(process_line, line): i for i, line in enumerate(lines)}
-        for fut in as_completed(fut_to_idx):
-            i = fut_to_idx[fut]
+        input_vtt_file = f.read()
+        log.info(f"input_vtt_file:\n{input_vtt_file}")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # futures = [executor.submit(process_sub, line) for line in input_vtt_file.splitlines()]
+        future_as_idx = {executor.submit(process_sub,line,i):i for i,line in enumerate(input_vtt_file.splitlines())}
+        results = {}
+        for future in as_completed(future_as_idx):
+            i = future_as_idx[future]
             try:
-                det = fut.result()
-                if det:
-                    results[i] = det
+                result = future.result()
+                log.info(f"original [{i}] : {input_vtt_file.splitlines()[i]}")
+                log.info(f"result  [{i}] : {result}")
+                if result:
+                    results[i] = result
+                 
             except Exception as e:
-                log.error("Error processing line [%s]: %s", i, e, exc_info=True)
+                log.error(f"Error processing line: {input_vtt_file.splitlines()[i]} ({e})")
+                log.error("error occured:",exc_info=True)
     return results
 
-
-def display_results(results: Dict[int, dict]):
-    """Sort and log results (reduced verbosity)."""
-    for index in sorted(results.keys()):
-        log.info("index:%s", index)
-        log.info("result:%s", results[index])
-
-
-def process_subtitle(video_path, subtitle_path, max_workers=12):
-    """Process subtitle file and write repositioned output. Preserves original behavior."""
+#-----------------------------------------------------printing out detections----------------------------------------------
+def display_results(results):
+    results = dict(sorted(results.items()))
+    for index , result in results.items():
+        log.info(f"index:{index}")
+        log.info(f"result:{result}")
+import time
+def process_subtitle(video_path, subtitle_path, max_workers = 12):
     start = time.time()
     ext = os.path.splitext(subtitle_path)[1].lower()
     print("in process subtitle")
-
     if ext == ".srt":
-        results = detect_text_srt(video_path, subtitle_path, max_workers=max_workers)
+        results = detect_text_srt(video_path,subtitle_path,max_workers=max_workers)
+        log.info(f"results:{results}")
         if results:
             display_results(results)
         else:
             print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
         reposition_srt(video_path, subtitle_path, output_file, results=results, max_workers=max_workers)
-
-    elif ext == ".ass":
-        results = detect_text_ass(video_path, subtitle_path, max_workers=max_workers)
+    elif ext ==".ass":
+        results = detect_text_ass(video_path,subtitle_path,max_workers=max_workers)
+        print("displaying results")
         if results:
             display_results(results)
         else:
             print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
-        reposition_ass(ass_path=subtitle_path, results=results, output_ass_path=output_file, max_workers=max_workers)
-
+        reposition_ass(ass_path=subtitle_path, output_ass_path=output_file,results=results, max_workers=max_workers)
     elif ext == ".ssa":
-        results = detect_text_ssa(video_path, subtitle_path, max_workers=max_workers)
+        results = detect_text_ssa(video_path,subtitle_path,max_workers=max_workers)
+        log.info(f"results :\n{results}\n type(results):{type(results)}")
         if results:
             display_results(results)
         else:
             print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ssa"
-        reposition_ssa(ssa_path=subtitle_path, results=results, output_ssa_path=output_file, max_workers=max_workers)
-
+        reposition_ssa(ssa_path=subtitle_path, output_ssa_path=output_file, results=results, max_workers=max_workers)
     elif ext == ".vtt":
-        results = detect_text_vtt(video_path, subtitle_path, max_workers=max_workers)
+        results = detect_text_vtt(video_path,subtitle_path,max_workers=max_workers)
+        log.info(results)
         if results:
             display_results(results)
         else:
             print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.vtt"
-        reposition_vtt(vtt_path=subtitle_path, results=results, output_vtt_path=output_file, max_workers=max_workers)
-
+        reposition_vtt(vtt_path=subtitle_path, output_vtt_path=output_file, results=results, max_workers=max_workers)
     else:
         raise ValueError(f"Unsupported subtitle format: {ext}")
 
-    log.info("Repositioned subtitle saved: %s", output_file)
+    log.info(f"Repositioned subtitle saved: {output_file}")
     print(f"Repositioned subtitle saved: {output_file}")
     end = time.time()
-    print("total time taken", end - start)
+    print("total time taken",end-start)
     return output_file
 
-
 if __name__ == "__main__":
-    # Example direct run (paths are placeholders for local testing)
+    #---------------------15 min -----------------------------------------
+    # video_path = r"..\videos_and_srt\Truck_Drivers_in_India.webm"
+    # sub_path = r"..\videos_and_srt\Truck_Drivers.ass"  # Try .ass or .vtt too
+    # process_subtitle(video_path, sub_path)
+    #---------------------15 min -----------------------------------------
+    #---------------------1/2 min -----------------------------------------
     video_path = r"uploads\Key_and_Peele_sample1.mp4"
-    sub_path = r"outputs\Key_and_Peele_sample1.ass"
+    sub_path = r"outputs\Key_and_Peele_sample1.ass"  # Try .ass or .vtt too
     max_workers = 10
-    process_subtitle(video_path, sub_path, max_workers)
+    process_subtitle(video_path, sub_path , max_workers)    
+    #---------------------1/2 min -----------------------------------------
+
+
+# videos_and_srt/The Seinfeld Chronicles.mp4
+# videos_and_srt/MEDICAMENTOS 1.mp4
+# videos_and_srt/Truck_Drivers_in_India.webm
+    # resp = reposition_ass(r"../videos_and_srt/Key_and_Peele_sample1.mp4",r"../videos_and_srt/Key_and_Peele_sample1_repositioned.ass","sample_output_ass.ass")
