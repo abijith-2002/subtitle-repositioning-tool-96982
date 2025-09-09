@@ -1,8 +1,23 @@
+# CRITICAL: Set environment variables that control native threading BEFORE importing numpy, cv2, onnxruntime, etc.
+# This reduces the risk of FFmpeg/OpenCV/BLAS thread contention that can trigger
+# "Assertion fctx->async_lock failed at libavcodec/pthread_frame.c:175".
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("OPENCV_OPENCL_DEVICE", "disabled")  # avoid implicit OpenCL threading
+# Optional global kill-switch to force fully single-threaded processing
+SR_SINGLE_THREAD = os.getenv("SR_SINGLE_THREAD", "0") == "1"
+# Optional env to override detection workers; default to 1 for safety
+SR_DETECT_MAX_WORKERS = int(os.getenv("SR_DETECT_MAX_WORKERS", "1"))
+
 import cv2
 import numpy as np
 import re
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
 
@@ -33,15 +48,27 @@ try:
     cv2.setNumThreads(1)
 except Exception:
     pass
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# Lazily create OCR engine per process, not at import time, and avoid global reuse across threads.
-# onnxruntime sessions can internally manage threads; creating per-call keeps lifecycle simple and avoids
-# cross-thread access issues when used with ThreadPoolExecutor.
+# Thread-local RapidOCR session to avoid cross-thread session sharing while still avoiding per-frame construction cost.
+_thread_local = threading.local()
+
 def _get_ocr_engine():
-    return RapidOCR() if RapidOCR else None
+    """
+    Create or reuse a thread-local RapidOCR engine. Avoids sharing sessions across threads which can
+    interact poorly with underlying onnxruntime threading, while reducing the overhead of creating
+    a new session for every frame.
+    """
+    if RapidOCR is None:
+        return None
+    engine = getattr(_thread_local, "rapidocr_engine", None)
+    if engine is None:
+        try:
+            engine = RapidOCR()
+        except Exception as e:
+            log.error("Failed to initialize RapidOCR engine: %s", e)
+            engine = None
+        _thread_local.rapidocr_engine = engine
+    return engine
 
 _counter = 0
 
@@ -56,9 +83,10 @@ class VideoContext:
     unsafe interaction of FFmpeg's async frame/threaded decoding with multiple threading layers (OpenCV,
     Python ThreadPoolExecutor, and ONNXRuntime). This module mitigates it by:
       - Disabling OpenCV's internal threading (cv2.setNumThreads(1)).
-      - Avoiding global shared ONNXRuntime session across threads (create per-call engine).
-      - Capping pool sizes.
-      - Removing pysrt (C-extension) in favor of pure-Python 'srt' to reduce ABI/runtime conflicts.
+      - Avoiding global shared ONNXRuntime session across threads (thread-local engine).
+      - Capping pool sizes / optional single-thread mode.
+      - Serializing VideoCapture seek/read operations via a lock to prevent concurrent access.
+      - Removing pysrt in favor of pure-Python 'srt' to reduce ABI/runtime conflicts.
     """
 
     def __init__(self, video_path: str):
@@ -66,6 +94,8 @@ class VideoContext:
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
+        # Some backends expose CAP_PROP_FORMAT/THREADS but not reliably; stick to serialized reads.
+        self._lock = threading.Lock()
         self.fps: float = float(self.cap.get(cv2.CAP_PROP_FPS) or 24.0)
         self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_count: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -74,8 +104,10 @@ class VideoContext:
         """Seek to a frame index and return the frame, or None if not available."""
         if frame_idx < 0 or frame_idx >= self.frame_count:
             return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-        ret, frame = self.cap.read()
+        # Serialize cap.set()/read() to avoid FFmpeg threaded decoder races
+        with self._lock:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ret, frame = self.cap.read()
         if not ret:
             return None
         return frame
@@ -104,7 +136,12 @@ def detect_using_rapidocr(img: np.ndarray) -> List[Dict[str, Any]]:
     detections: List[Dict[str, Any]] = []
     if results:
         for (box, text, score) in results:
-            detections.append({"box": box, "text": text, "score": float(score)})
+            # Normalize potential numpy types to Python primitives
+            try:
+                score_f = float(score)
+            except Exception:
+                score_f = 0.0
+            detections.append({"box": list(box) if box is not None else [], "text": str(text), "score": score_f})
     return detections
 
 
@@ -459,13 +496,22 @@ def detect_text_srt(video_path, srt_path, min_frames=3, max_workers=5):
         return i_sub, detections
 
     try:
-        workers = max(1, min(int(max_workers), 4))
+        # Enforce conservative worker count to avoid FFmpeg race; allow env override
+        if SR_SINGLE_THREAD:
+            workers = 1
+        else:
+            workers = max(1, min(int(max_workers), SR_DETECT_MAX_WORKERS))
         results: Dict[int, Any] = {}
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(process_one, i) for i in range(len(subs))]
-            for fut in as_completed(futures):
-                i_sub, det = fut.result()
+        if workers == 1:
+            for i in range(len(subs)):
+                i_sub, det = process_one(i)
                 results[i_sub] = det
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(process_one, i) for i in range(len(subs))]
+                for fut in as_completed(futures):
+                    i_sub, det = fut.result()
+                    results[i_sub] = det
         return results
     finally:
         ctx.release()
@@ -503,20 +549,36 @@ def detect_text_ass(video_path, ass_path, max_workers=5):
         input_ass_file = f.read()
         log.info("input_ass_file loaded")
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(input_ass_file.splitlines())}
-            results: Dict[int, Any] = {}
-            for future in as_completed(future_to_idx):
-                i = future_to_idx[future]
+        lines = input_ass_file.splitlines()
+        if SR_SINGLE_THREAD:
+            workers = 1
+        else:
+            workers = max(1, min(int(max_workers), SR_DETECT_MAX_WORKERS))
+        results: Dict[int, Any] = {}
+        if workers == 1:
+            for i, line in enumerate(lines):
                 try:
-                    result = future.result()
-                    log.info(f"original [{i}] : {input_ass_file.splitlines()[i]}")
+                    result = process_sub(line, i)
+                    log.info(f"original [{i}] : {lines[i]}")
                     log.info(f"result [{i}] : {result}")
                     if result:
                         results[i] = result
                 except Exception as e:
-                    log.error(f"Error processing line '{input_ass_file.splitlines()[i]}',Error:{e}")
-                    traceback.print_exc()
+                    log.error(f"Error processing line '{lines[i]}',Error:{e}", exc_info=True)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(lines)}
+                for future in as_completed(future_to_idx):
+                    i = future_to_idx[future]
+                    try:
+                        result = future.result()
+                        log.info(f"original [{i}] : {lines[i]}")
+                        log.info(f"result [{i}] : {result}")
+                        if result:
+                            results[i] = result
+                    except Exception as e:
+                        log.error(f"Error processing line '{lines[i]}',Error:{e}")
+                        traceback.print_exc()
         return results
     finally:
         ctx.release()
@@ -554,21 +616,38 @@ def detect_text_ssa(video_path, ssa_path, max_workers=5):
         input_ssa_file = f.read()
         log.info("input_ssa_file loaded")
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_as_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(input_ssa_file.splitlines())}
-            results: Dict[int, Any] = {}
-            k = 0
-            for future in as_completed(future_as_idx):
-                i = future_as_idx[future]
+        lines = input_ssa_file.splitlines()
+        if SR_SINGLE_THREAD:
+            workers = 1
+        else:
+            workers = max(1, min(int(max_workers), SR_DETECT_MAX_WORKERS))
+        results: Dict[int, Any] = {}
+        k = 0
+        if workers == 1:
+            for i, line in enumerate(lines):
                 try:
-                    result = future.result()
-                    log.info(f"original[{i}] : {input_ssa_file.splitlines()[i]}")
+                    result = process_sub(line, i)
+                    log.info(f"original[{i}] : {lines[i]}")
                     log.info(f"result [{i}] : {result}")
                     if result:
                         results[k] = result
                         k += 1
-                except Exception:
-                    log.error(f"Error processing line: {input_ssa_file.splitlines()[i]}")
+                except Exception as e:
+                    log.error(f"Error processing line: {lines[i]} ({e})", exc_info=True)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_as_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(lines)}
+                for future in as_completed(future_as_idx):
+                    i = future_as_idx[future]
+                    try:
+                        result = future.result()
+                        log.info(f"original[{i}] : {lines[i]}")
+                        log.info(f"result [{i}] : {result}")
+                        if result:
+                            results[k] = result
+                            k += 1
+                    except Exception as e:
+                        log.error(f"Error processing line: {lines[i]} ({e})", exc_info=True)
         return results
     finally:
         ctx.release()
@@ -609,19 +688,35 @@ def detect_text_vtt(video_path, vtt_path, max_workers=5):
         input_vtt_file = f.read()
         log.info("input_vtt_file loaded")
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_as_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(input_vtt_file.splitlines())}
-            results: Dict[int, Any] = {}
-            for future in as_completed(future_as_idx):
-                i = future_as_idx[future]
+        lines = input_vtt_file.splitlines()
+        if SR_SINGLE_THREAD:
+            workers = 1
+        else:
+            workers = max(1, min(int(max_workers), SR_DETECT_MAX_WORKERS))
+        results: Dict[int, Any] = {}
+        if workers == 1:
+            for i, line in enumerate(lines):
                 try:
-                    result = future.result()
-                    log.info(f"original [{i}] : {input_vtt_file.splitlines()[i]}")
+                    result = process_sub(line, i)
+                    log.info(f"original [{i}] : {lines[i]}")
                     log.info(f"result  [{i}] : {result}")
                     if result:
                         results[i] = result
                 except Exception as e:
-                    log.error(f"Error processing line: {input_vtt_file.splitlines()[i]} ({e})", exc_info=True)
+                    log.error(f"Error processing line: {lines[i]} ({e})", exc_info=True)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_as_idx = {executor.submit(process_sub, line, i): i for i, line in enumerate(lines)}
+                for future in as_completed(future_as_idx):
+                    i = future_as_idx[future]
+                    try:
+                        result = future.result()
+                        log.info(f"original [{i}] : {lines[i]}")
+                        log.info(f"result  [{i}] : {result}")
+                        if result:
+                            results[i] = result
+                    except Exception as e:
+                        log.error(f"Error processing line: {lines[i]} ({e})", exc_info=True)
         return results
     finally:
         ctx.release()
@@ -641,14 +736,23 @@ def process_subtitle(video_path: str, subtitle_path: str, max_workers: int = 8) 
 
     Mitigations for ffmpeg/libavcodec assertion:
     - OpenCV threads limited to 1 (cv2.setNumThreads(1)).
-    - Avoid global shared RapidOCR engine across threads; create per-call engines.
-    - Cap worker threads to a reasonable number (<=8, internally often <=4) to reduce contention.
+    - Avoid global shared RapidOCR engine across threads; use thread-local engines.
+    - Serialize VideoCapture read/seek operations across threads.
+    - Cap worker threads to 1 by default (configurable) to reduce contention.
+    - Provide SR_SINGLE_THREAD=1 env to force full single-thread mode.
 
     Returns path to the output file.
     """
     start = time.time()
     ext = os.path.splitext(subtitle_path)[1].lower()
     print("in process subtitle")
+    # Respect single-thread and detection worker cap env
+    if SR_SINGLE_THREAD:
+        safe_workers = 1
+    else:
+        safe_workers = max(1, min(int(max_workers), SR_DETECT_MAX_WORKERS))
+    max_workers = safe_workers
+    log.info("Processing with max_workers=%s (SR_SINGLE_THREAD=%s, SR_DETECT_MAX_WORKERS=%s)", max_workers, SR_SINGLE_THREAD, SR_DETECT_MAX_WORKERS)
     if ext == ".srt":
         results = detect_text_srt(video_path, subtitle_path, max_workers=max_workers)
         log.info(f"results:{results}")
@@ -685,7 +789,7 @@ def process_subtitle(video_path: str, subtitle_path: str, max_workers: int = 8) 
 
 if __name__ == "__main__":
     # Example paths; adjust as needed for local testing (use provided sample assets)
-    video_path = "subtitle_backend/Key_and_Peele_sample1.mp4"
-    sub_path = "subtitle_backend/Key_and_Peele_sample1.ass"
+    video_path = "Key_and_Peele_sample1.mp4"
+    sub_path = "Key_and_Peele_sample1.ass"
     max_workers = 6
     process_subtitle(video_path, sub_path, max_workers)
