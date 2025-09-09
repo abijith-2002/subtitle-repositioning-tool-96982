@@ -1,4 +1,0 @@
-2025-09-09 11:27:16,300 - INFO - input_ass_file loaded
-2025-09-09 11:27:16,302 - INFO - sub text: Because it's pronounced\N"Aaron".
-2025-09-09 11:27:16,302 - INFO - sub text: Son of a bitch!
-2025-09-09 11:27:16,303 - INFO - sub text: A.A. Ron!
