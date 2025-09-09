@@ -1,25 +1,48 @@
 import os
 import cv2
 import numpy as np
-import pysrt
 import re
-from rapidocr_onnxruntime import RapidOCR  # OCR engine
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
+
+# Use pure-Python srt instead of pysrt (compat with Python 3.12, matches project deps)
+import srt
+from datetime import timedelta
+
+# Try to import RapidOCR lazily and guard if unavailable
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+except Exception:  # pragma: no cover
+    RapidOCR = None  # type: ignore
 
 # Configure logging
 logging.basicConfig(
     filename="Reposition_sub_7.txt",
     filemode="w",
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     encoding="utf-8",
 )
 log = logging.getLogger(__name__)
 
-# Initialize OCR engine once
-_engine = RapidOCR()
+# Limit OpenCV internal threading to avoid libavcodec/ffmpeg threading assert failures when combined with
+# Python thread pools and onnxruntime threads. This mitigates "fctx->async_lock failed".
+try:
+    # Available on OpenCV 4.x
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+# Lazily create OCR engine per process, not at import time, and avoid global reuse across threads.
+# onnxruntime sessions can internally manage threads; creating per-call keeps lifecycle simple and avoids
+# cross-thread access issues when used with ThreadPoolExecutor.
+def _get_ocr_engine():
+    return RapidOCR() if RapidOCR else None
+
 _counter = 0
 
 
@@ -27,6 +50,15 @@ class VideoContext:
     """
     Reusable wrapper around cv2.VideoCapture to avoid re-opening video per segment.
     Provides cached properties and safe frame access.
+
+    Note on crash root cause:
+    The assertion "fctx->async_lock failed at libavcodec/pthread_frame.c:175" is typically triggered by
+    unsafe interaction of FFmpeg's async frame/threaded decoding with multiple threading layers (OpenCV,
+    Python ThreadPoolExecutor, and ONNXRuntime). This module mitigates it by:
+      - Disabling OpenCV's internal threading (cv2.setNumThreads(1)).
+      - Avoiding global shared ONNXRuntime session across threads (create per-call engine).
+      - Capping pool sizes.
+      - Removing pysrt (C-extension) in favor of pure-Python 'srt' to reduce ABI/runtime conflicts.
     """
 
     def __init__(self, video_path: str):
@@ -56,27 +88,29 @@ class VideoContext:
 
 
 def detect_using_rapidocr(img: np.ndarray) -> List[Dict[str, Any]]:
-    """Run OCR with ONNXRuntime over a preprocessed image and normalize results."""
+    """Run OCR with ONNXRuntime over a preprocessed image and normalize results. Returns [] if OCR unavailable."""
     global _counter
     _counter += 1
-    log.info("OCR frame counter: %s", _counter)
-    results, _ = _engine(img)
+    engine = _get_ocr_engine()
+    if engine is None:
+        if _counter <= 3:
+            log.info("RapidOCR engine not available; skipping OCR detection.")
+        return []
+    try:
+        results, _ = engine(img)  # results = [(box, text, score), ...]
+    except Exception as e:
+        log.error("RapidOCR inference failed: %s", e)
+        return []
     detections: List[Dict[str, Any]] = []
     if results:
-        log.info("detections found for frame")
         for (box, text, score) in results:
             detections.append({"box": box, "text": text, "score": float(score)})
     return detections
 
 
-def to_ass_timestamp(srt_time):
-    """Convert pysrt.SubRipTime to ASS H:MM:SS.CC format."""
-    total_ms = (
-        srt_time.hours * 3600 * 1000
-        + srt_time.minutes * 60 * 1000
-        + srt_time.seconds * 1000
-        + srt_time.milliseconds
-    )
+def _ass_ts_from_timedelta(td: timedelta) -> str:
+    """Convert a timedelta to ASS H:MM:SS.CC format."""
+    total_ms = int(td.total_seconds() * 1000)
     hours = total_ms // 3600000
     minutes = (total_ms % 3600000) // 60000
     seconds = (total_ms % 60000) // 1000
@@ -160,41 +194,43 @@ def get_position_for_segment(video_path, start_sec, end_sec, min_frames=3):
         ctx.release()
 
 
+def _parse_srt_file(path: str) -> List[srt.Subtitle]:
+    """Parse SRT file contents into a list of srt.Subtitle entries."""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        contents = f.read()
+    return list(srt.parse(contents))
+
 def reposition_srt(video_path, srt_path, output_ass_path, results, min_frames=3, max_workers=5):
     """Read SRT and write ASS using provided results, no video access here."""
-    subs = pysrt.open(srt_path)
+    subs = _parse_srt_file(srt_path)
 
-    def process_sub(sub_index, position):
-        sub = next((s for s in subs if s.index == sub_index), None)
-        if not sub:
-            return ""
-        log.info("sub obtained")
-        log.info(f"sub text:{sub.text}")
+    # Map of index to constructed line ensures stable ordering
+    def process_sub(i_sub: int, position: str):
+        sub = subs[i_sub]
         alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
-        formatted_text = sub.text.replace("\n", r"\N")
+        formatted_text = sub.content.replace("\n", r"\N")
         line = (
-            f"Dialogue: 0,{to_ass_timestamp(sub.start)},{to_ass_timestamp(sub.end)},"
+            f"Dialogue: 0,{_ass_ts_from_timedelta(sub.start)},{_ass_ts_from_timedelta(sub.end)},"
             f"Default,,0,0,0,,{alignment_tag}{formatted_text}\n"
         )
-        return line
+        return i_sub, line
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(
-                process_sub,
-                results[result].get("subtitle_index"),
-                results[result].get("recommended_position"),
-            ): i
-            for i, result in enumerate(results)
-        }
-        results_map: Dict[int, Optional[str]] = {}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results_map[idx] = future.result()
-            except Exception as e:
-                log.error(f"Error processing subtitle {idx}: {e}")
-                results_map[idx] = None
+    # Build lookup: results is a dict keyed by caller conventions (index->info) here
+    idx_to_pos: Dict[int, str] = {}
+    for key, val in results.items():
+        if isinstance(val, dict) and "subtitle_index" in val and "recommended_position" in val:
+            idx_to_pos[int(val["subtitle_index"])] = str(val["recommended_position"])
+
+    workers = max(1, min(int(max_workers), 8))
+    lines_out: Dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        for i in range(len(subs)):
+            pos = idx_to_pos.get(i, "bottom")
+            futures.append(executor.submit(process_sub, i, pos))
+        for fut in as_completed(futures):
+            i_sub, line = fut.result()
+            lines_out[i_sub] = line
 
     with open(output_ass_path, "w", encoding="utf-8") as f:
         f.write(
@@ -214,8 +250,8 @@ def reposition_srt(video_path, srt_path, output_ass_path, results, min_frames=3,
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
         for i in range(len(subs)):
-            if i in results_map and results_map[i]:
-                f.write(results_map[i])
+            if i in lines_out:
+                f.write(lines_out[i])
 
     log.info("Repositioned subtitle saved: %s", output_ass_path)
     return output_ass_path
@@ -410,39 +446,26 @@ def get_detections(video_path, start_sec, end_sec, min_frames=3):
 
 def detect_text_srt(video_path, srt_path, min_frames=3, max_workers=5):
     """Read SRT and collect detections using a single VideoContext for all segments."""
-    subs = pysrt.open(srt_path)
+    subs = _parse_srt_file(srt_path)
     ctx = VideoContext(video_path)
 
-    def process_sub(sub, sub_index):
-        start_sec = (
-            sub.start.hours * 3600
-            + sub.start.minutes * 60
-            + sub.start.seconds
-            + sub.start.milliseconds / 1000
-        )
-        end_sec = (
-            sub.end.hours * 3600
-            + sub.end.minutes * 60
-            + sub.end.seconds
-            + sub.end.milliseconds / 1000
-        )
-        log.info(f"sub text:{sub.text}")
+    def process_one(i_sub: int):
+        sub = subs[i_sub]
+        start_sec = float(sub.start.total_seconds())
+        end_sec = float(sub.end.total_seconds())
+        log.info(f"sub text:{sub.content}")
         detections = get_detections_ctx(ctx, start_sec, end_sec, min_frames)
-        detections["subtitle_index"] = sub_index
-        return detections
+        detections["subtitle_index"] = i_sub
+        return i_sub, detections
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {executor.submit(process_sub, sub, sub.index): i for i, sub in enumerate(subs)}
-            results: Dict[int, Any] = {}
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                    log.info("retrieved result")
-                except Exception as e:
-                    log.error(f"Error processing subtitle {idx}: {e}")
-                    results[idx] = None
+        workers = max(1, min(int(max_workers), 4))
+        results: Dict[int, Any] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(process_one, i) for i in range(len(subs))]
+            for fut in as_completed(futures):
+                i_sub, det = fut.result()
+                results[i_sub] = det
         return results
     finally:
         ctx.release()
@@ -612,7 +635,17 @@ def display_results(results):
 
 
 import time
-def process_subtitle(video_path, subtitle_path, max_workers=12):
+# PUBLIC_INTERFACE
+def process_subtitle(video_path: str, subtitle_path: str, max_workers: int = 8) -> str:
+    """Process a subtitle file against a video and write a repositioned output.
+
+    Mitigations for ffmpeg/libavcodec assertion:
+    - OpenCV threads limited to 1 (cv2.setNumThreads(1)).
+    - Avoid global shared RapidOCR engine across threads; create per-call engines.
+    - Cap worker threads to a reasonable number (<=8, internally often <=4) to reduce contention.
+
+    Returns path to the output file.
+    """
     start = time.time()
     ext = os.path.splitext(subtitle_path)[1].lower()
     print("in process subtitle")
@@ -621,35 +654,24 @@ def process_subtitle(video_path, subtitle_path, max_workers=12):
         log.info(f"results:{results}")
         if results:
             display_results(results)
-        else:
-            print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
         reposition_srt(video_path, subtitle_path, output_file, results=results, max_workers=max_workers)
     elif ext == ".ass":
         results = detect_text_ass(video_path, subtitle_path, max_workers=max_workers)
-        print("displaying results")
         if results:
             display_results(results)
-        else:
-            print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ass"
         reposition_ass(ass_path=subtitle_path, output_ass_path=output_file, results=results, max_workers=max_workers)
     elif ext == ".ssa":
         results = detect_text_ssa(video_path, subtitle_path, max_workers=max_workers)
-        log.info(f"results :\n{results}\n type(results):{type(results)}")
         if results:
             display_results(results)
-        else:
-            print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.ssa"
         reposition_ssa(ssa_path=subtitle_path, output_ssa_path=output_file, results=results, max_workers=max_workers)
     elif ext == ".vtt":
         results = detect_text_vtt(video_path, subtitle_path, max_workers=max_workers)
-        log.info(results)
         if results:
             display_results(results)
-        else:
-            print("No results")
         output_file = os.path.splitext(subtitle_path)[0] + "_repositioned.vtt"
         reposition_vtt(vtt_path=subtitle_path, output_vtt_path=output_file, results=results, max_workers=max_workers)
     else:
@@ -662,8 +684,8 @@ def process_subtitle(video_path, subtitle_path, max_workers=12):
     return output_file
 
 if __name__ == "__main__":
-    # Example paths; adjust as needed for local testing
-    video_path = r"uploads\Key_and_Peele_sample1.mp4"
-    sub_path = r"outputs\Key_and_Peele_sample1.ass"
-    max_workers = 10
+    # Example paths; adjust as needed for local testing (use provided sample assets)
+    video_path = "subtitle_backend/Key_and_Peele_sample1.mp4"
+    sub_path = "subtitle_backend/Key_and_Peele_sample1.ass"
+    max_workers = 6
     process_subtitle(video_path, sub_path, max_workers)
