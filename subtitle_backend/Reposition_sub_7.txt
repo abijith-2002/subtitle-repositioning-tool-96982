@@ -1,0 +1,12 @@
+2025-09-15 06:01:58,369 - INFO - get_position_for_segment: 0.0 -> 1.86
+2025-09-15 06:01:58,369 - INFO - get_position_for_segment: 2.12 -> 3.6
+2025-09-15 06:01:58,370 - INFO - get_position_for_segment: 5.54 -> 7.34
+2025-09-15 06:01:58,370 - INFO - get_position_for_segment: 7.88 -> 10.24
+2025-09-15 06:01:58,370 - INFO - get_position_for_segment: 10.24 -> 12.4
+2025-09-15 06:01:58,370 - INFO - get_position_for_segment: 13.88 -> 15.9
+2025-09-15 06:01:58,371 - INFO - get_position_for_segment: 17.84 -> 18.88
+2025-09-15 06:01:58,371 - INFO - get_position_for_segment: 19.04 -> 20.84
+2025-09-15 06:01:58,371 - INFO - get_position_for_segment: 20.84 -> 22.96
+2025-09-15 06:01:58,371 - INFO - get_position_for_segment: 22.26 -> 24.26
+2025-09-15 06:02:13,729 - INFO - get_position_for_segment: 25.26 -> 26.3
+2025-09-15 06:02:18,820 - INFO - Repositioned subtitle saved: /home/kavia/workspace/code-generation/subtitle-repositioning-tool-96982/subtitle_backend/data/uploads/50398a9b-3e1f-424c-a7d7-09cc6722d968/subtitle_repositioned.ass
