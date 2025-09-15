@@ -26,6 +26,7 @@ try:
     # RapidOCR ONNXRuntime engine for detection
     from rapidocr_onnxruntime import RapidOCR  # type: ignore
 except Exception:  # pragma: no cover - allow import to fail in environments without onnxruntime
+    # Graceful fallback path when OCR engine isn't available
     RapidOCR = None  # type: ignore
 
 # Configure logging (file in working dir)
