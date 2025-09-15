@@ -249,6 +249,32 @@ def _parse_srt_file(path: str):
     return list(srt.parse(contents))
 
 
+def _normalize_ass_alignment_tags(text: str) -> str:
+    """
+    Normalize any malformed ASS alignment tags to the correct form '{\\anN}'.
+
+    Fixes cases like:
+      - '{ n2}' (missing backslash and 'a')
+      - '{\\ n8}' (space after backslash)
+      - '{an2}' (missing backslash)
+      - '{\x07n2}' (bell character where '\a' was used)
+    Ensures exactly one leading backslash and 'a' before 'n'.
+    """
+    if not text:
+        return text
+
+    # Fix cases where backslash turned into bell character inside braces
+    text = re.sub(r"\{\x07n\s*([1-9])\s*\}", r"{\\an\1}", text)
+
+    # General fix: any brace-started token with optional slash/space/a before 'n' digit -> proper tag
+    text = re.sub(r"\{\s*\\?\s*a?\s*n\s*([1-9])\s*\}", r"{\\an\1}", text)
+
+    # Reduce any accidental double escaping inside brace to single (rare)
+    text = re.sub(r"\{\\\\an([1-9])\}", r"{\\an\1}", text)
+
+    return text
+
+
 def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_workers=5):
     """Read SRT via srt module, run OCR in parallel, output ASS with repositioned alignment tags."""
     subs = _parse_srt_file(srt_path)
@@ -261,12 +287,14 @@ def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_work
         start_sec, end_sec = segments[i_sub]
         # When many segments, usage of cache avoids repeated work; also allow a shared context for bursts
         position = get_position_for_segment(video_path, start_sec, end_sec, min_frames)
-        alignment_tag = r"{\an8}" if position == "top" else r"{\an2}"
-        formatted_text = sub.content.replace("\n", r"\N")
+        alignment_tag = r"{\\an8}" if position == "top" else r"{\\an2}"
+        formatted_text = sub.content.replace("\n", r"\\N")
         line = (
             f"Dialogue: 0,{to_ass_timestamp_from_timedelta(sub.start)},{to_ass_timestamp_from_timedelta(sub.end)},"
             f"Default,,0,0,0,,{alignment_tag}{formatted_text}\n"
         )
+        # Sanitize in case text contained braces or odd sequences
+        line = _normalize_ass_alignment_tags(line)
         return i_sub, line
 
     # Cap workers to a reasonable number to avoid oversubscription with OpenCV/onnxruntime
@@ -327,9 +355,12 @@ def reposition_ass(video_path, ass_path, output_ass_path, max_workers=5):
                 # Use context-aware decision (faster than cached facade for mass calls)
                 position = _decide_position_with_context(ctx, start_sec, end_sec)
                 if re.search(r"\{\\an\d\}", line):
-                    line = re.sub(r"\{\\an\d\}", r"{\an8}" if position == "top" else r"{\an2}", line)
+                    line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
                 else:
-                    line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
+                    # Append correct tag (use raw string with double-escaped backslash to emit a single backslash)
+                    line = line.rstrip("\n") + (r"{\\an8}" if position == "top" else r"{\\an2}")
+                # Normalize any malformed tags present originally
+                line = _normalize_ass_alignment_tags(line)
         return line
 
     with open(ass_path, "r", encoding="utf-8") as f:
@@ -373,9 +404,11 @@ def reposition_ssa(video_path, ssa_path, output_ssa_path, max_workers=5):
                 end_sec = ssa_time_to_sec(end_str)
                 position = _decide_position_with_context(ctx, start_sec, end_sec)
                 if re.search(r"\{\\an\d\}", line):
-                    line = re.sub(r"\{\\an\d\}", r"{\an8}" if position == "top" else r"{\an2}", line)
+                    line = re.sub(r"\{\\an\d\}", r"{\\an8}" if position == "top" else r"{\\an2}", line)
                 else:
-                    line = line.rstrip("\n") + (r"{\an8}" if position == "top" else r"{\an2}")
+                    line = line.rstrip("\n") + (r"{\\an8}" if position == "top" else r"{\\an2}")
+                # Normalize any malformed tags present originally
+                line = _normalize_ass_alignment_tags(line)
         return line
 
     with open(ssa_path, "r", encoding="utf-8") as f:
