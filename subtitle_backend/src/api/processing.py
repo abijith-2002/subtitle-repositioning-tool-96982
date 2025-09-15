@@ -13,6 +13,7 @@ Performance improvements:
 import os
 import re
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from functools import lru_cache
@@ -41,42 +42,55 @@ log = logging.getLogger(__name__)
 _engine = RapidOCR() if RapidOCR else None
 _counter = 0
 
+# Global guards to avoid libavcodec async_lock assertion and model contention.
+# Using RLock to be safe with nested acquisitions in same thread.
+_FFMPEG_GUARD = threading.RLock()
+_OCR_ENGINE_GUARD = threading.RLock()
+
 
 def _safe_video_capture(path: str) -> cv2.VideoCapture:
     """Open a video path with OpenCV and raise clear error if it fails."""
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {path}")
-    return cap
+    # Serialize creation to avoid concurrent ffmpeg open on the same file
+    with _FFMPEG_GUARD:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {path}")
+        return cap
 
 
 class VideoContext:
     """
     Hold a reusable VideoCapture and cached properties to avoid re-opening for each segment.
+    All cap operations are serialized via _FFMPEG_GUARD to avoid libavcodec thread contention.
     """
 
     def __init__(self, video_path: str):
         self.video_path = video_path
         self.cap = _safe_video_capture(video_path)
-        # Cache properties up front
-        self.fps: float = self.cap.get(cv2.CAP_PROP_FPS) or 24.0
-        self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.frame_count: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Cache properties up front (guard each property read)
+        with _FFMPEG_GUARD:
+            self.fps: float = self.cap.get(cv2.CAP_PROP_FPS) or 24.0
+            self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.frame_count: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     def read_frame(self, frame_idx: int) -> Optional[np.ndarray]:
-        """Seek to a frame index and read it; return None if not available."""
+        """Seek to a frame index and read it; return None if not available.
+        Guarded to avoid concurrent seek/read on the same decoder.
+        """
         if frame_idx < 0 or frame_idx >= self.frame_count:
             return None
-        # set and read
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-        ret, frame = self.cap.read()
+        with _FFMPEG_GUARD:
+            # set and read
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ret, frame = self.cap.read()
         if not ret:
             return None
         return frame
 
     def release(self):
         try:
-            self.cap.release()
+            with _FFMPEG_GUARD:
+                self.cap.release()
         except Exception:
             pass
 
@@ -93,7 +107,9 @@ def detect_using_rapidocr(img: np.ndarray):
         log.info("RapidOCR engine not available; skipping OCR detection.")
         return []
 
-    results, _ = _engine(img)  # results = [(box, text, score), ...]
+    # Serialize engine inference to avoid internal session contention
+    with _OCR_ENGINE_GUARD:
+        results, _ = _engine(img)  # results = [(box, text, score), ...]
     detections = []
     if results:
         # Convert to light-weight dicts
@@ -254,7 +270,8 @@ def reposition_srt(video_path, srt_path, output_ass_path, min_frames=3, max_work
         return i_sub, line
 
     # Cap workers to a reasonable number to avoid oversubscription with OpenCV/onnxruntime
-    workers = max(1, min(int(max_workers), 12))
+    # Too many threads can trigger ffmpeg/libav contention; keep modest.
+    workers = max(1, min(int(max_workers), 6))
     results = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(process_sub, i) for i in range(len(subs))]
@@ -319,7 +336,7 @@ def reposition_ass(video_path, ass_path, output_ass_path, max_workers=5):
         input_ass_file = f.read()
 
     output_ass_lines = input_ass_file.splitlines()
-    workers = max(1, min(int(max_workers), 12))
+    workers = max(1, min(int(max_workers), 6))
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_idx = {executor.submit(process_sub, line): i for i, line in enumerate(output_ass_lines)}
